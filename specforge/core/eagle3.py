@@ -20,6 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -33,7 +34,7 @@ from specforge.core.compact_teacher import (
 )
 from specforge.core.eagle3_adapters import BackendAdapter, SdpaLikeAdapter, UspAdapter
 from specforge.core.lk_loss import compute_acceptance_rate, compute_lk_loss
-from specforge.core.loss import LogSoftmaxLoss
+from specforge.core.loss import LogSoftmaxLoss, _compute_loss_reference
 from specforge.modeling.draft import Eagle3DraftModel
 from specforge.utils import padding
 
@@ -69,7 +70,15 @@ def _compute_loss_and_acceptance_rate(
         reduce_metrics_fn: Optional distributed reducer for metric numer/denom.
         reduce_loss_fn: Optional distributed reducer for KL loss.
     """
-    kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
+    # The default KL loss is a fused Triton kernel (LogSoftmaxLoss). In
+    # environments that cannot JIT-compile Triton/torch.compile launchers
+    # (e.g. no Python.h available), set SPECFORGE_REFERENCE_LOSS=1 to route
+    # the KL loss through the mathematically-equivalent eager PyTorch
+    # reference instead. The acceptance-rate computation below is unchanged.
+    if os.environ.get("SPECFORGE_REFERENCE_LOSS") == "1":
+        kl_loss = _compute_loss_reference(logits, target_p, position_mask)
+    else:
+        kl_loss = LogSoftmaxLoss.apply(logits, target_p, position_mask)
     if reduce_loss_fn is not None:
         kl_loss = reduce_loss_fn(kl_loss)
 

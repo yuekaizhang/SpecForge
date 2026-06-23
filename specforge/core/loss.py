@@ -21,6 +21,18 @@ def _compute_loss(logits, target_p, position_mask):
     return loss
 
 
+# Eager (non-compiled) reference implementation, mathematically equivalent to
+# both `_compute_loss` and the `LogSoftmaxLoss` Triton kernel. Used as a fallback
+# in environments where Triton / torch.compile cannot JIT-compile (e.g. no
+# Python.h to build the C launcher). Gated behind SPECFORGE_REFERENCE_LOSS=1.
+def _compute_loss_reference(logits, target_p, position_mask):
+    logits = logits.float()
+    out_logp = nn.LogSoftmax(dim=2)(logits)
+    plogp = target_p * out_logp
+    loss = -torch.sum(position_mask * plogp, 2).mean()
+    return loss
+
+
 def _calculate_settings(n):
     # reference: https://github.com/unslothai/unsloth/blob/fd753fed99ed5f10ef8a9b7139588d9de9ddecfb/unsloth/kernels/utils.py#L43
 

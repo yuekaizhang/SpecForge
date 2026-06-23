@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoProcessor, AutoTokenizer
 
-from datasets import Dataset
+from datasets import Dataset, load_from_disk
 from specforge import (
     AutoDraftModelConfig,
     AutoEagle3DraftModel,
@@ -414,17 +414,23 @@ def build_target_model(
                 trust_remote_code=args.trust_remote_code,
             )
 
-        # set the aux hidden states layers
-        if (
-            hasattr(draft_model_config, "eagle_config")
-            and draft_model_config.eagle_config is not None
-            and "eagle_aux_hidden_state_layer_ids" in draft_model_config.eagle_config
-        ):
-            target_model.set_aux_hidden_states_layers(
-                draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
-            )
-        else:
-            target_model.set_aux_hidden_states_layers()
+        # set the aux hidden states layers.
+        # The audio path uses a raw Qwen2AudioForConditionalGeneration target and
+        # captures aux hidden states via output_hidden_states=True inside
+        # QwenAudioOnlineEagle3Model (it selects the aux layers itself), so it does
+        # not implement set_aux_hidden_states_layers. Skip it for the audio case.
+        if not args.is_audio:
+            if (
+                hasattr(draft_model_config, "eagle_config")
+                and draft_model_config.eagle_config is not None
+                and "eagle_aux_hidden_state_layer_ids"
+                in draft_model_config.eagle_config
+            ):
+                target_model.set_aux_hidden_states_layers(
+                    draft_model_config.eagle_config["eagle_aux_hidden_state_layer_ids"]
+                )
+            else:
+                target_model.set_aux_hidden_states_layers()
 
         if args.is_audio:
             processor = AutoProcessor.from_pretrained(args.target_model_path)
@@ -584,10 +590,21 @@ def build_dataloaders(
         f"{args.target_model_path}"  # Tokenizer may also different
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
-    train_dataset = Dataset.from_generator(
-        generator=safe_conversations_generator,
-        gen_kwargs={"file_path": args.train_data_path},
-    )
+    # The train data path can be either a JSONL file of ShareGPT-style
+    # conversations or a `save_to_disk` dataset DIRECTORY (e.g. the audio
+    # datasets produced by scripts/prepare_aishell.py, which carry `audio`
+    # and `transcription` columns). Detect the on-disk dataset case and load
+    # it directly so the audio preprocessing path receives the right columns.
+    if os.path.isdir(args.train_data_path) and (
+        os.path.exists(os.path.join(args.train_data_path, "dataset_info.json"))
+        or os.path.exists(os.path.join(args.train_data_path, "state.json"))
+    ):
+        train_dataset = load_from_disk(args.train_data_path)
+    else:
+        train_dataset = Dataset.from_generator(
+            generator=safe_conversations_generator,
+            gen_kwargs={"file_path": args.train_data_path},
+        )
     is_online = (
         args.train_data_path is not None and args.train_hidden_states_path is None
     )
