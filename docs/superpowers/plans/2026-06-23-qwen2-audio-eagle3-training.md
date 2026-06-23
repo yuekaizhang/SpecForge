@@ -8,6 +8,13 @@
 
 **Tech Stack:** Python, PyTorch (bf16), HuggingFace transformers (Qwen2-Audio), SpecForge (EAGLE3 draft + TTT loss), `datasets`, `soundfile`. Training runs in an isolated env with SpecForge's pinned deps (torch 2.9.1 / transformers 4.57.1 / sglang 0.5.9).
 
+**ENV/API FACTS established by Task 0 (apply to all later tasks):**
+- The SpecForge env is `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/speculative/.specforge_env`, built on **Python 3.12** (3.13 lacks an `outlines_core==0.1.26` wheel). Activate: `source .specforge_env/bin/activate`. Versions confirmed: transformers 4.57.1 / torch 2.9.1+cu128 / sglang 0.5.9.
+- Qwen2-Audio processor kwarg is **`audio=`** (singular), NOT `audios=`. Wrong kwarg is silently ignored → no `input_features`.
+- `out.hidden_states` is a flat tuple of 33 (embedding + 32 LM layers), each `[1, seq, 4096]` — slice aux layers directly.
+- `model.config.audio_token_index == 151646`.
+- Always `export HF_HOME=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/speculative/.hf_cache` (Qwen2-Audio-7B already cached).
+
 **Spec:** `docs/superpowers/specs/2026-06-23-qwen2-audio-eagle3-training-design.md`
 
 **Repo root for all paths below:** `/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/speculative/SpecForge`
@@ -339,7 +346,7 @@ def preprocess_audio_conversations(
         )
         encoding = processor(
             text=text,
-            audios=[audio["array"]],
+            audio=[audio["array"]],  # NOTE: transformers 4.57.1 uses `audio=` (singular), NOT `audios=`
             sampling_rate=audio["sampling_rate"],
             return_tensors="pt",
             padding=True,
