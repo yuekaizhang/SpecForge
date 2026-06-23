@@ -331,6 +331,10 @@ def preprocess_audio_conversations(
         text = processor.apply_chat_template(
             conversation, tokenize=False, add_generation_prompt=False
         )
+        # NOTE: do not pass max_length/truncation here — the Qwen2-Audio processor
+        # would truncate the audio mel features (breaking the fixed 128x3000 shape
+        # the AudioDataCollator relies on). AISHELL transcripts are short; audio is
+        # fixed-length by the Whisper feature extractor.
         encoding = processor(
             text=text,
             audio=[audio["array"]],  # transformers 4.57.1 uses `audio=` (singular)
@@ -339,8 +343,6 @@ def preprocess_audio_conversations(
             padding=True,
             return_offsets_mapping=True,
             add_special_tokens=False,
-            max_length=max_length,
-            truncation=True,
         )
         input_ids = encoding["input_ids"][0]
         offsets = encoding["offset_mapping"][0]
