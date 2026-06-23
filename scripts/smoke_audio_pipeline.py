@@ -95,5 +95,30 @@ def check_preprocess():
     assert lm.sum() > 0, "loss mask is empty — assistant span not detected"
 
 
+def check_collate():
+    from datasets import load_from_disk
+    from transformers import AutoProcessor
+    from specforge.data.preprocessing import preprocess_audio_conversations
+    from specforge.data.template import TEMPLATE_REGISTRY
+    from specforge.data.utils import AudioDataCollatorWithPadding
+
+    template = TEMPLATE_REGISTRY.get("qwen")
+    processor = AutoProcessor.from_pretrained(MODEL)
+    ds = load_from_disk("/tmp/aishell_smoke")
+    feats = []
+    for k in range(2):
+        b = {"audio": [ds[k]["audio"]], "transcription": [ds[k]["transcription"]]}
+        o = preprocess_audio_conversations(processor, b, template, 2048)
+        feats.append({kk: vv[0] for kk, vv in o.items()})
+    batch = AudioDataCollatorWithPadding()(feats)
+    for k, v in batch.items():
+        print(k, None if v is None else tuple(v.shape))
+    assert batch["input_features"].shape[0] == 2
+
+
 if __name__ == "__main__":
-    {"target": check_target, "preprocess": check_preprocess}[sys.argv[1]]()
+    {
+        "target": check_target,
+        "preprocess": check_preprocess,
+        "collate": check_collate,
+    }[sys.argv[1]]()

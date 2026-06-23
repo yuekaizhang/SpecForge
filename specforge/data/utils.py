@@ -249,6 +249,36 @@ class VlmDataCollatorWithPadding:
         return batch
 
 
+class AudioDataCollatorWithPadding:
+    """Pads text fields; stacks fixed-size Qwen2-Audio mel features."""
+
+    def paddingtensor2D(self, intensors, N):
+        B, n = intensors.shape
+        pad = torch.zeros(B, N - n, dtype=intensors.dtype)
+        return torch.cat((intensors, pad), dim=1)
+
+    def __call__(self, features):
+        max_length = max(item["input_ids"].shape[1] for item in features)
+        batch = {
+            "input_ids": torch.cat(
+                [self.paddingtensor2D(f["input_ids"], max_length) for f in features]
+            ),
+            "attention_mask": torch.cat(
+                [self.paddingtensor2D(f["attention_mask"], max_length) for f in features]
+            ),
+            "loss_mask": torch.cat(
+                [self.paddingtensor2D(f["loss_mask"], max_length) for f in features]
+            ),
+            "input_features": torch.cat([f["input_features"] for f in features], dim=0),
+            "feature_attention_mask": torch.cat(
+                [f["feature_attention_mask"] for f in features], dim=0
+            ),
+            "hidden_state": None,
+            "target": None,
+        }
+        return batch
+
+
 def prepare_dp_dataloaders(
     dataset: Dataset,
     batch_size: int,
@@ -257,6 +287,7 @@ def prepare_dp_dataloaders(
     pin_memory: Optional[bool] = False,
     shuffle: Optional[bool] = False,
     is_vlm: Optional[bool] = False,
+    is_audio: Optional[bool] = False,
     prefetch_factor: Optional[int] = 2,
     **dataloader_kwargs,
 ) -> DataLoader:
@@ -271,6 +302,7 @@ def prepare_dp_dataloaders(
         pin_memory: Whether to pin memory for data loading.
         shuffle: Whether to shuffle the dataset.
         is_vlm: Whether the dataset is a vision-language model dataset.
+        is_audio: Whether the dataset is an audio-language model dataset.
         **dataloader_kwargs: Additional keyword arguments for the DataLoader.
 
     Returns:
@@ -281,10 +313,12 @@ def prepare_dp_dataloaders(
     sampler = DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
     )
-    if is_vlm:
-        datacollator_cls = VlmDataCollatorWithPadding
+    if is_audio:
+        collator = AudioDataCollatorWithPadding()
+    elif is_vlm:
+        collator = VlmDataCollatorWithPadding()
     else:
-        datacollator_cls = DataCollatorWithPadding
+        collator = DataCollatorWithPadding()
 
     if num_workers == 0:
         prefetch_factor = None
@@ -296,7 +330,7 @@ def prepare_dp_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         prefetch_factor=prefetch_factor,
-        collate_fn=datacollator_cls(),
+        collate_fn=collator,
         drop_last=True,
         **dataloader_kwargs,
     )
