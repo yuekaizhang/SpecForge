@@ -115,6 +115,11 @@ def build_parser() -> ArgumentParser:
         "--is-vlm", action="store_true", help="Whether the target model is a VLM"
     )
     model_group.add_argument(
+        "--is-audio",
+        action="store_true",
+        help="Set if the target is an audio model (e.g. Qwen2-Audio).",
+    )
+    model_group.add_argument(
         "--shard-target-output",
         action=argparse.BooleanOptionalAction,
         help="Whether the target model output is sharded across batch dimension",
@@ -369,7 +374,17 @@ def build_target_model(
         The target model.
     """
     if is_online:
-        if (
+        if args.is_audio:
+            from transformers import Qwen2AudioForConditionalGeneration
+
+            target_model = (
+                Qwen2AudioForConditionalGeneration.from_pretrained(
+                    args.target_model_path, torch_dtype=torch.bfloat16
+                )
+                .eval()
+                .cuda()
+            )
+        elif (
             args.is_vlm
             and draft_model_config.target_model_type == "qwen2_5_vl"
             and args.target_model_backend == "custom"
@@ -411,7 +426,9 @@ def build_target_model(
         else:
             target_model.set_aux_hidden_states_layers()
 
-        if args.is_vlm:
+        if args.is_audio:
+            processor = AutoProcessor.from_pretrained(args.target_model_path)
+        elif args.is_vlm:
             processor = AutoProcessor.from_pretrained(
                 args.target_model_path,
                 min_pixels=args.min_pixels,
@@ -583,6 +600,7 @@ def build_dataloaders(
             cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
             cache_key=cache_key,
             is_vlm=args.is_vlm,
+            is_audio=args.is_audio,
             is_preformatted=args.is_preformatted,
             processor=processor,
             num_proc=args.build_dataset_num_proc,
@@ -615,6 +633,7 @@ def build_dataloaders(
             else get_dp_group()
         ),
         is_vlm=args.is_vlm,
+        is_audio=args.is_audio,
     )
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
@@ -628,6 +647,7 @@ def build_dataloaders(
                 args.chat_template,
                 args.max_length,
                 is_vlm=args.is_vlm,
+                is_audio=args.is_audio,
                 processor=processor,
                 num_proc=args.build_dataset_num_proc,
                 is_preformatted=args.is_preformatted,
@@ -651,6 +671,7 @@ def build_dataloaders(
                 else get_dp_group()
             ),
             is_vlm=args.is_vlm,
+            is_audio=args.is_audio,
         )
         print_with_rank("Initialized eval dataloader")
     else:
@@ -730,7 +751,23 @@ def run_forward(
     List[torch.Tensor],
     List[torch.Tensor],
 ]:
-    if args.is_vlm and args.target_model_backend == "custom":
+    if args.is_audio:
+        (
+            plosses,
+            acceptance_rates,
+            acces,
+            acc_corrects,
+            acc_denoms,
+            metric_losses,
+            metric_loss_denoms,
+        ) = eagle3_model(
+            input_ids=data["input_ids"].cuda(),
+            attention_mask=data["attention_mask"].cuda(),
+            loss_mask=data["loss_mask"].cuda(),
+            input_features=data["input_features"].cuda().to(torch.bfloat16),
+            feature_attention_mask=data["feature_attention_mask"].cuda(),
+        )
+    elif args.is_vlm and args.target_model_backend == "custom":
         (
             plosses,
             acceptance_rates,
@@ -1046,7 +1083,20 @@ def main():
     # ================================================
     # 4. Build Eagle3 model
     # ================================================
-    if (
+    if args.is_audio:
+        from specforge.core.eagle3 import QwenAudioOnlineEagle3Model
+
+        eagle3_model = QwenAudioOnlineEagle3Model(
+            target_model=target_model,
+            draft_model=draft_model,
+            processor=processor,
+            length=args.ttt_length,
+            attention_backend=args.attention_backend,
+            lk_loss_type=args.lk_loss_type,
+            kl_scale=args.kl_scale,
+            kl_decay=args.kl_decay,
+        )
+    elif (
         args.is_vlm
         and getattr(draft_model_config, "target_model_type", None) == "qwen2_5_vl"
         and args.tp_size == 1
