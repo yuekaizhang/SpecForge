@@ -29,6 +29,8 @@ import warnings
 from collections import Counter
 from typing import Dict, List, Optional, Tuple, Union
 
+import numpy as np
+import soundfile as sf
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -57,6 +59,27 @@ Conversation = List[Dict[str, str]]
 # ==============================
 # This file is for preprocessing the data
 # ==============================
+
+
+def _to_16k_mono(audio):
+    """Return (array_float32, 16000) from either a decoded {'array','sampling_rate'}
+    dict or a raw {'bytes'/'path'} dict (datasets Audio(decode=False))."""
+    if isinstance(audio, dict) and audio.get("array") is not None:
+        arr = np.asarray(audio["array"], dtype=np.float32)
+        sr = int(audio.get("sampling_rate", 16000))
+    else:
+        data = audio["bytes"] if audio.get("bytes") is not None else audio["path"]
+        src = io.BytesIO(data) if isinstance(data, (bytes, bytearray)) else data
+        arr, sr = sf.read(src, dtype="float32")
+    if arr.ndim > 1:
+        arr = arr.mean(axis=1)
+    if sr != 16000:
+        n = int(round(len(arr) / sr * 16000))
+        arr = np.interp(
+            np.linspace(0, len(arr) - 1, n), np.arange(len(arr)), arr
+        ).astype(np.float32)
+        sr = 16000
+    return arr, sr
 
 
 def _apply_loss_mask_from_chat_template(
@@ -335,10 +358,11 @@ def preprocess_audio_conversations(
         # would truncate the audio mel features (breaking the fixed 128x3000 shape
         # the AudioDataCollator relies on). AISHELL transcripts are short; audio is
         # fixed-length by the Whisper feature extractor.
+        arr, sr = _to_16k_mono(audio)
         encoding = processor(
             text=text,
-            audio=[audio["array"]],  # transformers 4.57.1 uses `audio=` (singular)
-            sampling_rate=audio["sampling_rate"],
+            audio=[arr],  # transformers 4.57.1 uses `audio=` (singular)
+            sampling_rate=sr,
             return_tensors="pt",
             padding=True,
             return_offsets_mapping=True,

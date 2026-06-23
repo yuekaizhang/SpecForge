@@ -139,6 +139,18 @@ def build_parser() -> ArgumentParser:
     dataset_group.add_argument("--train-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-hidden-states-path", type=str, default=None)
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
+    dataset_group.add_argument(
+        "--train-split",
+        type=str,
+        default="train",
+        help="Split to load when --train-data-path is an HF dataset id (audio path).",
+    )
+    dataset_group.add_argument(
+        "--eval-split",
+        type=str,
+        default="validation",
+        help="Split to load when --eval-data-path is an HF dataset id (audio path).",
+    )
     dataset_group.add_argument("--chat-template", type=str, default="llama3")
     dataset_group.add_argument(
         "--is-preformatted",
@@ -483,9 +495,9 @@ def sp_sanity_check(args: Namespace) -> None:
     args.draft_accumulation_steps = (
         args.draft_accumulation_steps * args.sp_ulysses_size * args.sp_ring_size
     )
-    assert (
-        args.batch_size == 1
-    ), f"USP only supports batch_size=1, got batch_size={args.batch_size}"
+    assert args.batch_size == 1, (
+        f"USP only supports batch_size=1, got batch_size={args.batch_size}"
+    )
 
     assert args.sp_ring_size * args.sp_ulysses_size > 1, (
         f"USP requires sp_ring_size * sp_ulysses_size > 1. "
@@ -600,6 +612,18 @@ def build_dataloaders(
         or os.path.exists(os.path.join(args.train_data_path, "state.json"))
     ):
         train_dataset = load_from_disk(args.train_data_path)
+    elif args.is_audio and not (
+        os.path.isfile(args.train_data_path) or os.path.isdir(args.train_data_path)
+    ):
+        # Audio path: --train-data-path is an HF dataset id (e.g. carlot/AIShell).
+        # Cast `audio` to Audio(decode=False) BEFORE build_eagle3_dataset's .map so
+        # the broken torchcodec auto-decode is never triggered; the raw bytes are
+        # decoded inline by preprocess_audio_conversations via soundfile.
+        from datasets import load_dataset
+        from datasets.features import Audio
+
+        train_dataset = load_dataset(args.train_data_path, split=args.train_split)
+        train_dataset = train_dataset.cast_column("audio", Audio(decode=False))
     else:
         train_dataset = Dataset.from_generator(
             generator=safe_conversations_generator,
@@ -654,10 +678,20 @@ def build_dataloaders(
     )
     if args.eval_data_path is not None or args.eval_hidden_states_path is not None:
         if args.eval_data_path is not None:
-            eval_dataset = Dataset.from_generator(
-                generator=safe_conversations_generator,
-                gen_kwargs={"file_path": args.eval_data_path},
-            )
+            if args.is_audio and not (
+                os.path.isfile(args.eval_data_path)
+                or os.path.isdir(args.eval_data_path)
+            ):
+                from datasets import load_dataset
+                from datasets.features import Audio
+
+                eval_dataset = load_dataset(args.eval_data_path, split=args.eval_split)
+                eval_dataset = eval_dataset.cast_column("audio", Audio(decode=False))
+            else:
+                eval_dataset = Dataset.from_generator(
+                    generator=safe_conversations_generator,
+                    gen_kwargs={"file_path": args.eval_data_path},
+                )
             eval_eagle3_dataset = build_eagle3_dataset(
                 eval_dataset,
                 tokenizer,
