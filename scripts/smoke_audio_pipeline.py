@@ -2,6 +2,7 @@
 Run pieces via: python scripts/smoke_audio_pipeline.py <check>
 where <check> in {target, preprocess, collate, eagle3}.
 """
+
 import sys
 import numpy as np
 import torch
@@ -41,7 +42,7 @@ def check_target():
         conversation, tokenize=False, add_generation_prompt=False
     )
     inputs = processor(
-        text=text, audios=[audio], sampling_rate=sr, return_tensors="pt", padding=True
+        text=text, audio=[audio], sampling_rate=sr, return_tensors="pt", padding=True
     )
     inputs = {k: v.cuda() for k, v in inputs.items()}
     with torch.no_grad():
@@ -69,5 +70,30 @@ def check_target():
     print("OK: aux layer indices valid for", n_layers, "layers")
 
 
+def check_preprocess():
+    from datasets import load_from_disk
+    from transformers import AutoProcessor
+    from specforge.data.preprocessing import preprocess_audio_conversations
+    from specforge.data.template import TEMPLATE_REGISTRY
+
+    template = TEMPLATE_REGISTRY.get(
+        "qwen"
+    )  # use the template name confirmed in Step C
+    processor = AutoProcessor.from_pretrained(MODEL)
+    ds = load_from_disk("/tmp/aishell_smoke")
+    batch = {
+        "audio": [ds[0]["audio"], ds[1]["audio"]],
+        "transcription": [ds[0]["transcription"], ds[1]["transcription"]],
+    }
+    out = preprocess_audio_conversations(processor, batch, template, max_length=2048)
+    ii = out["input_ids"][0]
+    lm = out["loss_mask"][0]
+    print("input_ids shape:", tuple(ii.shape), "loss_mask sum:", int(lm.sum()))
+    print("input_features shape:", tuple(out["input_features"][0].shape))
+    masked = processor.tokenizer.decode(ii[0][lm[0].bool()])
+    print("loss-masked (assistant) text:", repr(masked))
+    assert lm.sum() > 0, "loss mask is empty — assistant span not detected"
+
+
 if __name__ == "__main__":
-    {"target": check_target}[sys.argv[1]]()
+    {"target": check_target, "preprocess": check_preprocess}[sys.argv[1]]()

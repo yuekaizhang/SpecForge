@@ -293,6 +293,69 @@ def preprocess_vlm_conversations(
     return results
 
 
+def preprocess_audio_conversations(
+    processor,
+    examples,
+    chat_template: ChatTemplate,
+    max_length: int = 2048,
+    instruction: str = "请将这段音频转写为文本。",
+) -> Dict[str, List[torch.Tensor]]:
+    """Preprocess AISHELL-style audio+transcription examples for Qwen2-Audio.
+
+    examples columns:
+        - audio: {"array": np.ndarray, "sampling_rate": int}
+        - transcription: str
+    Returns input_ids, loss_mask, attention_mask, input_features, feature_attention_mask.
+    """
+    results = {
+        "input_ids": [],
+        "loss_mask": [],
+        "attention_mask": [],
+        "input_features": [],
+        "feature_attention_mask": [],
+    }
+    for i, audio in enumerate(examples["audio"]):
+        transcription = examples["transcription"][i]
+        if not transcription:
+            continue
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio", "audio_url": "audio.wav"},
+                    {"type": "text", "text": instruction},
+                ],
+            },
+            {"role": "assistant", "content": transcription},
+        ]
+        text = processor.apply_chat_template(
+            conversation, tokenize=False, add_generation_prompt=False
+        )
+        encoding = processor(
+            text=text,
+            audio=[audio["array"]],  # transformers 4.57.1 uses `audio=` (singular)
+            sampling_rate=audio["sampling_rate"],
+            return_tensors="pt",
+            padding=True,
+            return_offsets_mapping=True,
+            add_special_tokens=False,
+        )
+        input_ids = encoding["input_ids"][0]
+        offsets = encoding["offset_mapping"][0]
+        decoded_conversation = processor.tokenizer.decode(
+            input_ids, skip_special_tokens=False
+        )
+        loss_mask = _apply_loss_mask_from_chat_template(
+            decoded_conversation, offsets, chat_template
+        )
+        results["input_ids"].append(input_ids[None, :])
+        results["loss_mask"].append(loss_mask[None, :])
+        results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+        results["input_features"].append(encoding["input_features"])
+        results["feature_attention_mask"].append(encoding["feature_attention_mask"])
+    return results
+
+
 def build_eagle3_dataset(
     dataset: HFDataset,
     tokenizer: PreTrainedTokenizer,
@@ -303,6 +366,7 @@ def build_eagle3_dataset(
     cache_dir: Optional[str] = None,
     cache_key: Optional[str] = None,
     is_vlm: Optional[bool] = False,
+    is_audio: Optional[bool] = False,
     processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
@@ -337,16 +401,16 @@ def build_eagle3_dataset(
     Returns:
         The processed HF dataset.
     """
-    if is_vlm:
-        assert processor is not None, "processor must be provided when is_vlm is True"
+    if is_vlm or is_audio:
+        assert processor is not None, "processor must be provided for is_vlm/is_audio"
 
     # Validate chat_template requirement
     if chat_template is None:
         raise ValueError("chat_template must be provided for all dataset types")
 
-    assert (
-        chat_template in TEMPLATE_REGISTRY.get_all_template_names()
-    ), f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
+    assert chat_template in TEMPLATE_REGISTRY.get_all_template_names(), (
+        f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
+    )
 
     template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
 
@@ -355,7 +419,14 @@ def build_eagle3_dataset(
 
     def preprocess_function(examples):
         # Handle different dataset formats
-        if is_vlm:
+        if is_audio:
+            processed = preprocess_audio_conversations(
+                processor,
+                examples,
+                template,
+                max_length,
+            )
+        elif is_vlm:
             processed = preprocess_vlm_conversations(
                 processor,
                 examples,
@@ -667,7 +738,6 @@ def build_offline_eagle3_dataset(
     ttt_length: int = 1,
     use_usp_preprocess: bool = False,
 ) -> torch.utils.data.Dataset:
-
     return OfflineEagle3Dataset(
         list_local_files(hidden_states_path),
         max_len=max_len,
