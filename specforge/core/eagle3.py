@@ -790,6 +790,207 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         )
 
 
+class QwenAudioOnlineEagle3Model(Eagle3Model):
+    """Online EAGLE3 training for Qwen2-Audio. Audio is consumed by the target
+    only; the draft is a text-token predictor conditioned on the target's
+    (audio-aware) aux hidden states. Standard 1D RoPE (no M-RoPE)."""
+
+    def __init__(
+        self,
+        target_model,
+        draft_model,
+        processor,
+        length=7,
+        attention_backend="sdpa",
+        lk_loss_type=None,
+        kl_scale=1.0,
+        kl_decay=1.0,
+    ):
+        super().__init__()
+        self.target_model = target_model
+        self.draft_model = draft_model
+        self.processor = processor
+        self.length = length
+        self.attention_backend = attention_backend
+        self.lk_loss_type = lk_loss_type
+        self.kl_scale = kl_scale
+        self.kl_decay = kl_decay
+
+    @torch.no_grad()
+    def _prepare_data(
+        self,
+        input_ids,
+        attention_mask,
+        loss_mask,
+        input_features=None,
+        feature_attention_mask=None,
+        device=None,
+    ):
+        if device is None:
+            device = input_ids.device
+        outputs = self.target_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            input_features=input_features,
+            feature_attention_mask=feature_attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        num_hidden_states = len(outputs.hidden_states)
+        offset = 1
+        num_layers = num_hidden_states - 1
+        low_aux_layer = 1 + offset
+        mid_aux_layer = num_layers // 2 - 1 + offset
+        last_aux_layer = num_layers - 4 + offset
+        hidden_states = torch.cat(
+            (
+                outputs.hidden_states[low_aux_layer],
+                outputs.hidden_states[mid_aux_layer],
+                outputs.hidden_states[last_aux_layer],
+            ),
+            dim=-1,
+        )
+        target = padding(outputs.logits, left=False)
+        input_ids = padding(input_ids, left=False)
+        if target is not None:
+            target = target.to(device)
+            loss_mask = loss_mask[..., None].to(device)
+        return hidden_states, target, loss_mask, input_ids
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        loss_mask,
+        input_features=None,
+        feature_attention_mask=None,
+        past_key_values=None,
+        position_ids=None,
+    ):
+        hidden_states, target, loss_mask, input_ids = self._prepare_data(
+            input_ids, attention_mask, loss_mask, input_features, feature_attention_mask
+        )
+        (
+            target_p_padded,
+            target_p_on_draft_padded,
+            target_token_ids_padded,
+            position_mask,
+        ) = _compute_target_p_padded(
+            target=target,
+            t2d=self.draft_model.t2d,
+            loss_mask=loss_mask,
+            length=self.length,
+        )
+        del target
+        batch_size, seq_length, _ = hidden_states.shape
+        past_key_values_length = 0
+        hidden_states = self.draft_model.project_hidden_states(hidden_states)
+        if position_ids is None:
+            am = (
+                attention_mask
+                if attention_mask is not None
+                else torch.ones(
+                    batch_size,
+                    seq_length,
+                    device=hidden_states.device,
+                    dtype=torch.long,
+                )
+            )
+            position_ids = am.long().cumsum(-1) - 1
+            position_ids.masked_fill_(am == 0, 1)
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
+            )
+        if self.attention_backend == "sdpa":
+            attention_mask = self.draft_model.prepare_decoder_attention_mask(
+                attention_mask=attention_mask,
+                hidden_states=hidden_states,
+                batch_size=batch_size,
+                seq_length=seq_length,
+                past_key_values_length=past_key_values_length,
+            )
+        plosses, acceptance_rates, acces = [], [], []
+        metric_corrects, metric_denoms, metric_losses, metric_loss_denoms = (
+            [],
+            [],
+            [],
+            [],
+        )
+        if self.attention_backend in ["sdpa", "fa"]:
+            cache_hidden = [[], []]
+            past_key_values = None
+        elif self.attention_backend == "flex_attention":
+            cache_hidden = None
+            past_key_values = DynamicCache()
+        else:
+            raise ValueError(f"Unknown attention backend: {self.attention_backend}")
+        for idx in range(self.length):
+            target_p = target_p_padded[:, idx : idx + seq_length, :].contiguous()
+            target_p_on_draft = target_p_on_draft_padded[
+                :, idx : idx + seq_length, :
+            ].contiguous()
+            target_token_ids = target_token_ids_padded[
+                :, idx : idx + seq_length
+            ].contiguous()
+            is_last = idx == self.length - 1
+            inputs_embeds = self.draft_model.embed_input_ids(input_ids).to(
+                hidden_states.dtype
+            )
+            hidden_states = self.draft_model.backbone(
+                input_embeds=inputs_embeds,
+                hidden_states=hidden_states,
+                cache_hidden=cache_hidden,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            logits = self.draft_model.compute_logits(hidden_states)
+            with torch.no_grad():
+                correct, denom = _compute_metric_counts(
+                    logits=logits,
+                    target_token_ids=target_token_ids,
+                    loss_mask=loss_mask,
+                    d2t=self.draft_model.d2t,
+                )
+                acces.append(correct / denom)
+                metric_corrects.append(correct)
+                metric_denoms.append(denom)
+            acceptance_rate, loss = _compute_loss_and_acceptance_rate(
+                logits=logits,
+                target_p=target_p,
+                target_p_on_draft=target_p_on_draft,
+                position_mask=position_mask,
+                lk_loss_type=self.lk_loss_type,
+                kl_scale=self.kl_scale,
+                kl_decay=self.kl_decay,
+            )
+            acceptance_rates.append(acceptance_rate)
+            plosses.append(loss)
+            metric_losses.append(loss.detach())
+            metric_loss_denoms.append(
+                torch.tensor(
+                    logits.shape[0] * logits.shape[1],
+                    device=logits.device,
+                    dtype=torch.float32,
+                )
+            )
+            if not is_last:
+                input_ids = padding(input_ids, left=False)
+                position_mask = padding(position_mask, left=False)
+                loss_mask = padding(loss_mask, left=False)
+        return (
+            plosses,
+            acceptance_rates,
+            acces,
+            metric_corrects,
+            metric_denoms,
+            metric_losses,
+            metric_loss_denoms,
+        )
+
+
 def _compute_target_p_padded(target, t2d, loss_mask, length):
     with torch.no_grad():
         (
