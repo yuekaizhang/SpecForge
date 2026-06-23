@@ -339,6 +339,8 @@ def preprocess_audio_conversations(
             padding=True,
             return_offsets_mapping=True,
             add_special_tokens=False,
+            max_length=max_length,
+            truncation=True,
         )
         input_ids = encoding["input_ids"][0]
         offsets = encoding["offset_mapping"][0]
