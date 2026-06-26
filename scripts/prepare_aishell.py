@@ -36,16 +36,21 @@ def main():
     ds = load_dataset("carlot/AIShell", split=args.split, streaming=True)
     ds = ds.cast_column("audio", Audio(decode=False))
 
-    rows = []
-    for i, ex in enumerate(ds):
-        if i >= args.num_samples:
-            break
-        arr = decode_16k_mono(ex["audio"])
-        rows.append({"array": arr, "sampling_rate": 16000, "transcription": ex["transcription"]})
+    def gen():
+        n = 0
+        for ex in ds:
+            if n >= args.num_samples:
+                break
+            t = ex["transcription"]
+            if not t:
+                continue
+            arr = decode_16k_mono(ex["audio"])
+            yield {"audio": {"array": arr, "sampling_rate": 16000}, "transcription": t}
+            n += 1
+            if n % 2000 == 0:
+                print(f"  decoded {n}", flush=True)
 
-    out = Dataset.from_list(
-        [{"audio": {"array": r["array"], "sampling_rate": 16000}, "transcription": r["transcription"]} for r in rows]
-    )
+    out = Dataset.from_generator(gen)
     out.save_to_disk(args.out)
     print(f"saved {len(out)} examples to {args.out}")
     print("example transcription:", out[0]["transcription"])
