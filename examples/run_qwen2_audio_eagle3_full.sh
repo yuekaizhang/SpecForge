@@ -48,5 +48,8 @@ torchrun --nproc_per_node 8 scripts/train_eagle3.py \
   --wandb-project qwen2audio-eagle3-aishell \
   --wandb-name "$WANDB_NAME" \
   --wandb-dir $ROOT/wandb \
+  --eval-data-path carlot/AIShell \
+  --eval-split "validation[:500]" \
+  --eval-interval 2000 \
   --save-interval 2000 \
   --output-dir outputs/qwen2-audio-7b-eagle3-full

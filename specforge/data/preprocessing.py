@@ -341,6 +341,11 @@ def preprocess_audio_conversations(
         transcription = examples["transcription"][i]
         if not transcription:
             continue
+        # AISHELL (Mandarin) transcripts are space-separated by word segmentation
+        # (e.g. "而 对 楼市"). Strip whitespace so the training target matches the
+        # natural, space-free text the target model actually emits at inference,
+        # reducing the train/inference distribution mismatch.
+        transcription = "".join(transcription.split())
         conversation = [
             {
                 "role": "user",
