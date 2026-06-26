@@ -24,6 +24,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 NUM_EPOCHS=${NUM_EPOCHS:-1}
 RESUME_ARG=""; [ "${RESUME:-0}" = "1" ] && RESUME_ARG="--resume"
 WANDB_NAME=${WANDB_NAME:-aishell-full-ep${NUM_EPOCHS}}
+# Online by default (uploads to wandb.ai; needs WANDB_API_KEY in env, which is set).
+# Set WANDB_OFFLINE=1 to log locally only (then `wandb sync $ROOT/wandb` later).
+WANDB_OFFLINE_ARG=""; [ "${WANDB_OFFLINE:-0}" = "1" ] && WANDB_OFFLINE_ARG="--wandb-offline"
 # W&B in offline mode (container may not reach api.wandb.ai); `wandb sync $ROOT/wandb`
 # from the login node later. Override project/name via WANDB_NAME env.
 torchrun --nproc_per_node 8 scripts/train_eagle3.py \
@@ -44,7 +47,7 @@ torchrun --nproc_per_node 8 scripts/train_eagle3.py \
   --num-epochs $NUM_EPOCHS \
   $RESUME_ARG \
   --report-to wandb \
-  --wandb-offline \
+  $WANDB_OFFLINE_ARG \
   --wandb-project qwen2audio-eagle3-aishell \
   --wandb-name "$WANDB_NAME" \
   --wandb-dir $ROOT/wandb \
