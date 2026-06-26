@@ -28,6 +28,11 @@ WANDB_NAME=${WANDB_NAME:-aishell-full-ep${NUM_EPOCHS}}
 # Set WANDB_OFFLINE=1 to log locally only (then `wandb sync $ROOT/wandb` later).
 WANDB_OFFLINE_ARG=""; [ "${WANDB_OFFLINE:-0}" = "1" ] && WANDB_OFFLINE_ARG="--wandb-offline"
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen2-audio-7b-eagle3-full}
+# rank-0 builds the (large, single-proc) dataset cache while other ranks wait at
+# the rank_0_priority barrier; that build can take ~30min, exceeding the default
+# 20min collective timeout. Give a generous timeout so the first run (cold cache)
+# does not time out. Subsequent runs hit the warm cache and pass instantly.
+DIST_TIMEOUT=${DIST_TIMEOUT:-120}
 # W&B in offline mode (container may not reach api.wandb.ai); `wandb sync $ROOT/wandb`
 # from the login node later. Override project/name via WANDB_NAME env.
 torchrun --nproc_per_node 8 scripts/train_eagle3.py \
@@ -41,6 +46,7 @@ torchrun --nproc_per_node 8 scripts/train_eagle3.py \
   --target-model-backend custom \
   --embedding-key language_model.model.embed_tokens.weight \
   --attention-backend sdpa \
+  --dist-timeout $DIST_TIMEOUT \
   --batch-size 1 \
   --max-length 768 \
   --learning-rate 2e-4 \
