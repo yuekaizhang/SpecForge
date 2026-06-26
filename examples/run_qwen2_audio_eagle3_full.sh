@@ -1,6 +1,6 @@
 #!/bin/bash
 # Full AISHELL train-split, 1 epoch, 8-GPU data-parallel.
-# Effective batch = 8 (batch-size 1 per GPU x 8 ranks). lr scaled 1e-4 -> 2e-4.
+# Effective batch = 8 (batch-size 1 per GPU x 8 ranks). lr 1e-4 = repo EAGLE3 standard.
 # Checkpoints every ~3000 steps (~hourly). Same env workarounds as the proof run
 # (sdpa attention, reference loss, OMP=1, expandable allocator) — see comments in
 # run_qwen2_audio_eagle3_online.sh for why.
@@ -49,7 +49,7 @@ torchrun --nproc_per_node 8 scripts/train_eagle3.py \
   --dist-timeout $DIST_TIMEOUT \
   --batch-size 1 \
   --max-length 768 \
-  --learning-rate 2e-4 \
+  --learning-rate 1e-4 \
   --ttt-length 5 \
   --num-epochs $NUM_EPOCHS \
   $RESUME_ARG \
