@@ -27,6 +27,7 @@ WANDB_NAME=${WANDB_NAME:-aishell-full-ep${NUM_EPOCHS}}
 # Online by default (uploads to wandb.ai; needs WANDB_API_KEY in env, which is set).
 # Set WANDB_OFFLINE=1 to log locally only (then `wandb sync $ROOT/wandb` later).
 WANDB_OFFLINE_ARG=""; [ "${WANDB_OFFLINE:-0}" = "1" ] && WANDB_OFFLINE_ARG="--wandb-offline"
+OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen2-audio-7b-eagle3-full}
 # W&B in offline mode (container may not reach api.wandb.ai); `wandb sync $ROOT/wandb`
 # from the login node later. Override project/name via WANDB_NAME env.
 torchrun --nproc_per_node 8 scripts/train_eagle3.py \
@@ -55,4 +56,4 @@ torchrun --nproc_per_node 8 scripts/train_eagle3.py \
   --eval-split "validation[:500]" \
   --eval-interval 2000 \
   --save-interval 2000 \
-  --output-dir outputs/qwen2-audio-7b-eagle3-full
+  --output-dir $OUTPUT_DIR
