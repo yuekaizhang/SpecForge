@@ -146,6 +146,13 @@ def build_parser() -> ArgumentParser:
         help="Split to load when --train-data-path is an HF dataset id (audio path).",
     )
     dataset_group.add_argument(
+        "--label-override",
+        type=str,
+        default=None,
+        help="JSONL with regenerated labels {idx, target_gen} to replace GT transcriptions. "
+             "Produced by scripts/regenerate_labels.py. Eliminates train/inference distribution mismatch.",
+    )
+    dataset_group.add_argument(
         "--eval-split",
         type=str,
         default="validation",
@@ -599,7 +606,8 @@ def build_dataloaders(
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
-        f"{args.target_model_path}"  # Tokenizer may also different
+        f"{args.target_model_path}-"  # Tokenizer may also different
+        f"{args.label_override or ''}"  # regenerated labels → new cache key
     )
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     # The train data path can be either a JSONL file of ShareGPT-style
@@ -624,6 +632,28 @@ def build_dataloaders(
 
         train_dataset = load_dataset(args.train_data_path, split=args.train_split)
         train_dataset = train_dataset.cast_column("audio", Audio(decode=False))
+        # Replace GT transcriptions with target model's own generations (from regenerate_labels.py)
+        # to eliminate the train/inference distribution mismatch.
+        if getattr(args, "label_override", None):
+            import json as _json
+
+            label_map = {}
+            with open(args.label_override) as _f:
+                for _line in _f:
+                    _d = _json.loads(_line)
+                    if not _d.get("target_gen", "").startswith("ERROR"):
+                        label_map[_d["idx"]] = _d["target_gen"]
+
+            def _replace_label(example, idx):
+                if idx in label_map:
+                    example["transcription"] = label_map[idx]
+                return example
+
+            train_dataset = train_dataset.map(_replace_label, with_indices=True)
+            print_on_rank0(
+                f"Replaced {len(label_map)} transcriptions with regenerated labels "
+                f"from {args.label_override}"
+            )
     else:
         train_dataset = Dataset.from_generator(
             generator=safe_conversations_generator,
