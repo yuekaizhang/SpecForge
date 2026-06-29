@@ -29,8 +29,8 @@ CONTAINER=/lustre/fsw/portfolios/coreai/users/yuekaiz/containers/nemo_rl.0615.re
 # Defaults: SFT target model + matched prompt (100% GT alignment, no train/infer mismatch)
 TARGET_MODEL=${TARGET_MODEL:-yuekai/qwen2_audio_aishell_sft}
 INSTRUCTION=${INSTRUCTION:-"Detect the language and recognize the speech: <|zh|>"}
-LR=${LR:-1e-4}
-WARMUP_RATIO=${WARMUP_RATIO:-0.015}
+LR=${LR:-1e-5}
+WARMUP_RATIO=${WARMUP_RATIO:-0.003}
 NUM_EPOCHS=${NUM_EPOCHS:-10}
 RESUME=${RESUME:-0}
 OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen2-audio-sft-eagle3}
