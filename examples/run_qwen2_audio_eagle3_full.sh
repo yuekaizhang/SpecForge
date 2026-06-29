@@ -33,7 +33,8 @@ OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen2-audio-7b-eagle3-full}
 # 20min collective timeout. Give a generous timeout so the first run (cold cache)
 # does not time out. Subsequent runs hit the warm cache and pass instantly.
 DIST_TIMEOUT=${DIST_TIMEOUT:-120}
-LR=${LR:-1e-4}  # repo EAGLE3 standard; override e.g. LR=5e-5
+LR=${LR:-1e-5}  # best from sweep (1e-5 > 5e-5 at equal epochs)
+WARMUP_RATIO=${WARMUP_RATIO:-0.003}  # best from sweep (0.003)
 # W&B in offline mode (container may not reach api.wandb.ai); `wandb sync $ROOT/wandb`
 # from the login node later. Override project/name via WANDB_NAME env.
 torchrun --nproc_per_node 8 scripts/train_eagle3.py \
@@ -51,6 +52,7 @@ torchrun --nproc_per_node 8 scripts/train_eagle3.py \
   --batch-size 1 \
   --max-length 768 \
   --learning-rate $LR \
+  --warmup-ratio $WARMUP_RATIO \
   --ttt-length 5 \
   --num-epochs $NUM_EPOCHS \
   $RESUME_ARG \
