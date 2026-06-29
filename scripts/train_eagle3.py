@@ -606,9 +606,11 @@ def build_dataloaders(
         f"{args.train_data_path}-"
         f"{args.max_length}-"
         f"{args.chat_template}-"
-        f"{args.target_model_path}-"  # Tokenizer may also different
-        f"{args.label_override or ''}"  # regenerated labels → new cache key
+        f"{args.target_model_path}"  # Tokenizer may also different
     )
+    # Only change cache key when regenerated labels are used (otherwise identical to original)
+    if getattr(args, "label_override", None):
+        cache_params_string += f"-label_override:{args.label_override}"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     # The train data path can be either a JSONL file of ShareGPT-style
     # conversations or a `save_to_disk` dataset DIRECTORY (e.g. the audio
