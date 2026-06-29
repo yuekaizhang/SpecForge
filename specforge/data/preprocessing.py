@@ -403,6 +403,7 @@ def build_eagle3_dataset(
     processor: Optional[ImageProcessingMixin] = None,
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
+    instruction: Optional[str] = None,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -453,11 +454,15 @@ def build_eagle3_dataset(
     def preprocess_function(examples):
         # Handle different dataset formats
         if is_audio:
+            audio_kwargs = {}
+            if instruction is not None:
+                audio_kwargs["instruction"] = instruction
             processed = preprocess_audio_conversations(
                 processor,
                 examples,
                 template,
                 max_length,
+                **audio_kwargs,
             )
         elif is_vlm:
             processed = preprocess_vlm_conversations(

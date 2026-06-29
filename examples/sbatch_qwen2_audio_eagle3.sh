@@ -25,13 +25,16 @@ set -euo pipefail
 ROOT=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/speculative
 CONTAINER=/lustre/fsw/portfolios/coreai/users/yuekaiz/containers/nemo_rl.0615.rebuild.sqsh
 
-# --- per-run knobs (override via env at submit; defaults = the 1e-5 experiment) ---
-LR=${LR:-1e-5}
-WARMUP_RATIO=${WARMUP_RATIO:-0.003}
+# --- per-run knobs (override via env at submit) ---
+# Defaults: SFT target model + matched prompt (100% GT alignment, no train/infer mismatch)
+TARGET_MODEL=${TARGET_MODEL:-yuekai/qwen2_audio_aishell_sft}
+INSTRUCTION=${INSTRUCTION:-"Detect the language and recognize the speech: <|zh|>"}
+LR=${LR:-1e-4}
+WARMUP_RATIO=${WARMUP_RATIO:-0.015}
 NUM_EPOCHS=${NUM_EPOCHS:-10}
 RESUME=${RESUME:-0}
-OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen2-audio-7b-eagle3-clean-1e5-warmup003}
-WANDB_NAME=${WANDB_NAME:-aishell-clean-10ep-1e5-warmup003}
+OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen2-audio-sft-eagle3}
+WANDB_NAME=${WANDB_NAME:-aishell-sft-eagle3-10ep}
 # wandb online by default (needs WANDB_API_KEY in the submitting env so srun
 # propagates it). If the key is absent, set WANDB_OFFLINE=1 to log to $ROOT/wandb.
 WANDB_OFFLINE=${WANDB_OFFLINE:-0}
@@ -48,6 +51,7 @@ srun \
   --no-container-mount-home \
   --export=ALL \
   bash -lc "cd $ROOT/SpecForge && \
+    TARGET_MODEL=$TARGET_MODEL INSTRUCTION='$INSTRUCTION' \
     LR=$LR WARMUP_RATIO=$WARMUP_RATIO NUM_EPOCHS=$NUM_EPOCHS RESUME=$RESUME \
     OUTPUT_DIR=$OUTPUT_DIR WANDB_NAME=$WANDB_NAME WANDB_OFFLINE=$WANDB_OFFLINE \
     bash examples/run_qwen2_audio_eagle3_full.sh"

@@ -146,6 +146,13 @@ def build_parser() -> ArgumentParser:
         help="Split to load when --train-data-path is an HF dataset id (audio path).",
     )
     dataset_group.add_argument(
+        "--instruction",
+        type=str,
+        default=None,
+        help="Audio instruction prompt (default: model-dependent). "
+             "E.g. 'Detect the language and recognize the speech: <|zh|>' for SFT models.",
+    )
+    dataset_group.add_argument(
         "--label-override",
         type=str,
         default=None,
@@ -608,9 +615,11 @@ def build_dataloaders(
         f"{args.chat_template}-"
         f"{args.target_model_path}"  # Tokenizer may also different
     )
-    # Only change cache key when regenerated labels are used (otherwise identical to original)
+    # Only change cache key when regenerated labels or custom instruction are used
     if getattr(args, "label_override", None):
         cache_params_string += f"-label_override:{args.label_override}"
+    if getattr(args, "instruction", None):
+        cache_params_string += f"-instruction:{args.instruction}"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     # The train data path can be either a JSONL file of ShareGPT-style
     # conversations or a `save_to_disk` dataset DIRECTORY (e.g. the audio
@@ -678,6 +687,7 @@ def build_dataloaders(
             processor=processor,
             num_proc=args.build_dataset_num_proc,
             train_only_last_turn=args.train_only_last_turn,
+            instruction=getattr(args, "instruction", None),
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
