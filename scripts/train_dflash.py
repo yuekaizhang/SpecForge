@@ -31,6 +31,7 @@ from specforge.distributed import destroy_distributed, get_dp_group, init_distri
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.target.dflash_target_model import (
     DFlashTargetModel,
+    HFDFlashTargetModel,
     get_dflash_target_model,
 )
 from specforge.modeling.target.target_utils import TargetEmbeddingsAndHead
@@ -124,9 +125,14 @@ def parse_args():
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
+    dataset_group.add_argument("--train-split", type=str, default="train")
     dataset_group.add_argument("--eval-data-path", type=str, default=None)
     dataset_group.add_argument("--chat-template", type=str, default="qwen")
     dataset_group.add_argument("--is-preformatted", action="store_true")
+    dataset_group.add_argument("--is-audio", action="store_true",
+                               help="Target is an audio model (e.g. Qwen2-Audio)")
+    dataset_group.add_argument("--instruction", type=str, default=None,
+                               help="Audio instruction prompt")
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
     dataset_group.add_argument(
         "--build-dataset-num-proc",
@@ -179,20 +185,28 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
         f"Loading target model from {args.target_model_path} using {args.target_model_backend} backend"
     )
 
-    target_model_kwargs = {}
-    if args.target_model_backend == "sglang":
-        target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
-
     device = get_local_device()
     device_type = device.type
 
-    target_model = get_dflash_target_model(
-        pretrained_model_name_or_path=args.target_model_path,
-        backend=args.target_model_backend,
-        torch_dtype=torch.bfloat16,
-        device=device_type if args.target_model_backend == "hf" else None,
-        trust_remote_code=args.trust_remote_code,
-        **target_model_kwargs,
+    if args.is_audio:
+        # Audio model: load Qwen2Audio directly, wrap in HFDFlashTargetModel
+        from transformers import Qwen2AudioForConditionalGeneration
+        raw_model = Qwen2AudioForConditionalGeneration.from_pretrained(
+            args.target_model_path, torch_dtype=torch.bfloat16,
+            trust_remote_code=args.trust_remote_code,
+        ).eval().to(device)
+        target_model = HFDFlashTargetModel(raw_model)
+    else:
+        target_model_kwargs = {}
+        if args.target_model_backend == "sglang":
+            target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+        target_model = get_dflash_target_model(
+            pretrained_model_name_or_path=args.target_model_path,
+            backend=args.target_model_backend,
+            torch_dtype=torch.bfloat16,
+            device=device_type if args.target_model_backend == "hf" else None,
+            trust_remote_code=args.trust_remote_code,
+            **target_model_kwargs,
     )
 
     if args.draft_config_path:
@@ -247,15 +261,33 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         f"{args.chat_template}-"
         f"{args.target_model_path}"
     )
+    if getattr(args, "instruction", None):
+        cache_params_string += f"-instruction:{args.instruction}"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
-    train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+    if getattr(args, "is_audio", False) and not (
+        os.path.isfile(args.train_data_path) or os.path.isdir(args.train_data_path)
+    ):
+        from datasets.features import Audio
+        train_dataset = load_dataset(args.train_data_path, split=args.train_split)
+        train_dataset = train_dataset.cast_column("audio", Audio(decode=False))
+    else:
+        train_dataset = load_dataset("json", data_files=args.train_data_path)["train"]
+
+    processor = None
+    if getattr(args, "is_audio", False):
+        from transformers import AutoProcessor
+        processor = AutoProcessor.from_pretrained(args.target_model_path)
+
     train_eagle3_dataset = build_eagle3_dataset(
         dataset=train_dataset,
         tokenizer=tokenizer,
         chat_template=args.chat_template,
         max_length=args.max_length,
         is_preformatted=args.is_preformatted,
+        is_audio=getattr(args, "is_audio", False),
+        processor=processor,
+        instruction=getattr(args, "instruction", None),
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=cache_key,
         num_proc=args.build_dataset_num_proc,
@@ -276,6 +308,7 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         num_workers=args.dataloader_num_workers,
         shuffle=True,
         process_group=get_dp_group(),
+        is_audio=getattr(args, "is_audio", False),
     )
 
     eval_dataloader = None
@@ -554,8 +587,12 @@ def main():
             input_ids = data["input_ids"].to(device, non_blocking=True)
             attention_mask = data["attention_mask"].to(device, non_blocking=True)
             loss_mask = data["loss_mask"].to(device, non_blocking=True)
+            target_kwargs = {}
+            if getattr(args, "is_audio", False):
+                target_kwargs["input_features"] = data["input_features"].to(device, dtype=torch.bfloat16, non_blocking=True)
+                target_kwargs["feature_attention_mask"] = data["feature_attention_mask"].to(device, non_blocking=True)
             target_output = target_model.generate_dflash_data(
-                input_ids, attention_mask, loss_mask
+                input_ids, attention_mask, loss_mask, **target_kwargs
             )
             hidden_states = target_output.hidden_states.to(device, non_blocking=True)
 

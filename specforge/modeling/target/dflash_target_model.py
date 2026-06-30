@@ -56,6 +56,7 @@ class DFlashTargetModel(ABC):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        **kwargs,
     ) -> DFlashTargetOutput:
         """Generate context hidden states for DFlash training."""
 
@@ -261,12 +262,14 @@ class HFDFlashTargetModel(DFlashTargetModel):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        **kwargs,
     ) -> DFlashTargetOutput:
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
             use_cache=False,
+            **kwargs,
         )
 
         # hidden_states[0] = embedding output; hidden_states[i+1] = layer i output
