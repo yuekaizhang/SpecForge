@@ -135,7 +135,9 @@ def main():
     ap.add_argument("--server", default="http://127.0.0.1:31040")
     ap.add_argument("--model", default="qwen2audio-sft")
     ap.add_argument("--dataset", default="carlot/AIShell")
+    ap.add_argument("--subset", default=None, help="Dataset config/subset name")
     ap.add_argument("--split", default="test")
+    ap.add_argument("--text-column", default="transcription", help="Column with GT text")
     ap.add_argument(
         "--prompt",
         default="Detect the language and recognize the speech: <|zh|>",
@@ -162,7 +164,7 @@ def main():
     from datasets.features import Audio
 
     print(f"Loading {args.dataset} split={args.split} ...")
-    ds = load_dataset(args.dataset, split=args.split)
+    ds = load_dataset(args.dataset, args.subset, split=args.split) if args.subset else load_dataset(args.dataset, split=args.split)
     ds = ds.cast_column("audio", Audio(decode=False))
     total = len(ds) if args.num_samples <= 0 else min(args.num_samples, len(ds))
     print(f"Total: {total} utterances, concurrency={args.concurrency}")
@@ -226,7 +228,7 @@ def main():
 
         # Phase 3: collect results
         for idx, clip, out in zip(v_indices, v_clips, outputs):
-            gt = "".join(ds[int(idx)]["transcription"].split())
+            gt = "".join(ds[int(idx)][args.text_column].split())
             if isinstance(out, Exception):
                 hyp, latency = f"ERROR: {out}", 0.0
             else:

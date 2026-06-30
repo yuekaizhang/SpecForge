@@ -174,3 +174,54 @@ SpecForge/scripts/
   debug_eagle3_failures.py    — Detailed failure analysis with categories
   regenerate_labels.py        — Target-model label regeneration (multi-server)
 ```
+
+---
+
+## 6. Out-of-domain evaluation: Speechio 00011
+
+Speechio is a multi-domain Chinese ASR benchmark with longer utterances than AISHELL. Subset 00011 has the longest average sentences — a better test for speculative decoding acceleration since longer outputs mean more decode steps.
+
+### Dataset stats
+
+| Property | AISHELL test | Speechio 00011 |
+|----------|-------------|----------------|
+| Utterances | 7176 | 1053 |
+| Mean duration | ~5s | **11.8s** |
+| Max duration | ~15s | **22.2s** |
+| Mean text (chars) | ~13 | **50** |
+| Domain | Read speech | Law / news (OOD for AISHELL-SFT model) |
+
+### EAGLE3 vs Baseline — Speechio 00011 (topk=1)
+
+| Metric | Baseline | EAGLE3 | Delta |
+|--------|----------|--------|-------|
+| **CER** | 14.60% | **14.51%** | **lossless** ✓ |
+| **Exact match** | 267/1053 (25%) | 270/1053 (26%) | ~identical |
+| **Wall time** | 38.9s | **34.0s** | **-12.6%** |
+| **Overall RTF** | 0.0031 | **0.0027** | -13% |
+| **Mean utt latency** | 0.554s | **0.479s** | **-13.5%** |
+| **Throughput** | 27.0 utt/s | **31.0 utt/s** | **+15%** |
+| **Accept length** | — | **2.30** | — |
+
+### Cross-dataset comparison
+
+| Dataset | Domain | Mean utt len | Accept len | Wall speedup | CER delta |
+|---------|--------|-------------|------------|-------------|-----------|
+| AISHELL test | In-domain (train=AISHELL) | ~5s / 13 chars | **3.33** | **-16.5%** | 0% (lossless) |
+| Speechio 00011 | **OOD** (law/news) | 11.8s / 50 chars | **2.30** | **-12.6%** | 0% (lossless) |
+
+### Analysis
+
+- **CER lossless on OOD data** — speculative decoding does not degrade accuracy even on out-of-domain inputs (14.51% vs 14.60% is within noise).
+- **Accept length drops on OOD** (3.33→2.30) — the draft was trained on AISHELL, so its predictions are weaker on unseen law/news domain. This is expected: the draft's vocabulary patterns (trained on read speech) don't fully transfer to spontaneous legal discourse.
+- **Speedup still meaningful** (~13-15%) — longer utterances provide more decode steps where the draft can contribute, partially compensating for the lower accept rate.
+- **Higher CER (14.5% vs 2.0%)** is the target model's OOD generalization gap, not the draft's fault — the SFT model was fine-tuned only on AISHELL.
+- **Improving OOD accept length** would require training the draft on multi-domain data (not just AISHELL), or using a target model that generalizes better across domains.
+
+### Results files
+
+```
+results/
+  speechio11_eagle3/     — EAGLE3 decode on Speechio 00011
+  speechio11_baseline/   — Baseline decode on Speechio 00011
+```
