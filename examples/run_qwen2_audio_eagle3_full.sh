@@ -33,20 +33,21 @@ OUTPUT_DIR=${OUTPUT_DIR:-outputs/qwen2-audio-7b-eagle3-full}
 # 20min collective timeout. Give a generous timeout so the first run (cold cache)
 # does not time out. Subsequent runs hit the warm cache and pass instantly.
 DIST_TIMEOUT=${DIST_TIMEOUT:-120}
-TARGET_MODEL=${TARGET_MODEL:-yuekai/qwen2_audio_aishell_sft}
+TARGET_MODEL=${TARGET_MODEL:-$ROOT/.hf_cache/hub/models--yuekai--qwen2_audio_aishell_sft/snapshots/1cbdccf78fb863da86f0049a2930dcf2950bff37}
 INSTRUCTION=${INSTRUCTION:-"Detect the language and recognize the speech: <|zh|>"}
 LR=${LR:-1e-5}  # best from sweep
 WARMUP_RATIO=${WARMUP_RATIO:-0.003}  # best from sweep (0.003)
 # W&B in offline mode (container may not reach api.wandb.ai); `wandb sync $ROOT/wandb`
 # from the login node later. Override project/name via WANDB_NAME env.
-INSTRUCTION_ARG=""; [ -n "$INSTRUCTION" ] && INSTRUCTION_ARG="--instruction $INSTRUCTION"
+INSTRUCTION_ARGS=()
+[ -n "$INSTRUCTION" ] && INSTRUCTION_ARGS=(--instruction "$INSTRUCTION")
 torchrun --nproc_per_node 8 scripts/train_eagle3.py \
-  --target-model-path $TARGET_MODEL \
-  --draft-model-config configs/qwen2-audio-7b-eagle3.json \
+  --target-model-path "$TARGET_MODEL" \
+  --draft-model-config ${DRAFT_CONFIG:-configs/qwen2-audio-7b-eagle3.json} \
   --train-data-path carlot/AIShell \
   --train-split train \
   --is-audio \
-  $INSTRUCTION_ARG \
+  "${INSTRUCTION_ARGS[@]}" \
   --chat-template qwen \
   --build-dataset-num-proc 1 \
   --target-model-backend custom \

@@ -27,7 +27,7 @@ CONTAINER=/lustre/fsw/portfolios/coreai/users/yuekaiz/containers/nemo_rl.0615.re
 
 # --- per-run knobs (override via env at submit) ---
 # Defaults: SFT target model + matched prompt (100% GT alignment, no train/infer mismatch)
-TARGET_MODEL=${TARGET_MODEL:-yuekai/qwen2_audio_aishell_sft}
+TARGET_MODEL=${TARGET_MODEL:-$ROOT/.hf_cache/hub/models--yuekai--qwen2_audio_aishell_sft/snapshots/1cbdccf78fb863da86f0049a2930dcf2950bff37}
 INSTRUCTION=${INSTRUCTION:-"Detect the language and recognize the speech: <|zh|>"}
 LR=${LR:-1e-5}
 WARMUP_RATIO=${WARMUP_RATIO:-0.003}
@@ -38,6 +38,7 @@ WANDB_NAME=${WANDB_NAME:-aishell-sft-eagle3-10ep}
 # wandb online by default (needs WANDB_API_KEY in the submitting env so srun
 # propagates it). If the key is absent, set WANDB_OFFLINE=1 to log to $ROOT/wandb.
 WANDB_OFFLINE=${WANDB_OFFLINE:-0}
+DRAFT_CONFIG=${DRAFT_CONFIG:-configs/qwen2-audio-7b-eagle3.json}
 
 mkdir -p "$ROOT/logs/slurm"
 
@@ -51,7 +52,7 @@ srun \
   --no-container-mount-home \
   --export=ALL \
   bash -lc "cd $ROOT/SpecForge && \
-    TARGET_MODEL=$TARGET_MODEL INSTRUCTION='$INSTRUCTION' \
+    TARGET_MODEL=$TARGET_MODEL INSTRUCTION='$INSTRUCTION' DRAFT_CONFIG=$DRAFT_CONFIG \
     LR=$LR WARMUP_RATIO=$WARMUP_RATIO NUM_EPOCHS=$NUM_EPOCHS RESUME=$RESUME \
     OUTPUT_DIR=$OUTPUT_DIR WANDB_NAME=$WANDB_NAME WANDB_OFFLINE=$WANDB_OFFLINE \
     bash examples/run_qwen2_audio_eagle3_full.sh"
