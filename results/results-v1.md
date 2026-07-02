@@ -11,6 +11,8 @@
 | Training config | LR=1e-5, warmup_ratio=0.003, ttt_length=5, batch=1/GPU×8 DP, 10 epochs |
 | Instruction prompt | `Detect the language and recognize the speech: <|zh|>` |
 | Inference engine | sglang dev-HEAD with `qwen2_audio.py` EAGLE3 shim |
+| Inference GPUs | 2× H100 (TP=2) |
+| Client concurrency | 16 |
 | Eval dataset | AISHELL test set (7176 utterances) |
 
 ### Key design choices

@@ -199,3 +199,6 @@ wandb/
 
 # macOS
 .DS_Store
+
+# benchmark run artifacts (keep results/*.md docs, ignore per-run output dirs)
+results/*/
