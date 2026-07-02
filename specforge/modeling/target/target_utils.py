@@ -74,7 +74,17 @@ class TargetEmbeddingsAndHead(nn.Module):
                 print(f"Warning: Snapshot download failed or path check failed: {e}")
 
         # 3. Handle Weight Tying
+        # For composite / multimodal configs (e.g. Qwen2-Audio), tying of the
+        # *text* LM head is governed by the inner text_config, NOT the top-level
+        # flag. Qwen2-Audio sets top-level tie_word_embeddings=True but
+        # text_config.tie_word_embeddings=False and ships a real untied
+        # language_model.lm_head.weight. Reading the top-level flag here would
+        # silently alias lm_head to embed_tokens and train the draft against the
+        # wrong head, producing accept_length=1.0 at serve time.
         tie_weights = getattr(config, "tie_word_embeddings", False)
+        text_config = getattr(config, "text_config", None)
+        if text_config is not None and hasattr(text_config, "tie_word_embeddings"):
+            tie_weights = getattr(text_config, "tie_word_embeddings")
 
         # 4. Load Weights
         instance._load_weights(local_model_path, embed_key, lm_head_key, tie_weights)

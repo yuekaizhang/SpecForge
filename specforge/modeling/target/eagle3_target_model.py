@@ -3,41 +3,64 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-import sglang.srt.managers.mm_utils as mm_utils
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
-    init_mm_embedding_cache,
-)
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-    Req,
-    ScheduleBatch,
-)
-
-# - prepare_mlp_sync_batch_raw is now a module-level function, not a Scheduler method
-from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
-from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
 from specforge.distributed import get_tp_device_mesh, get_tp_group
 from specforge.utils import padding
 
-from .sglang_backend import SGLangRunner, wrap_eagle3_logits_processors_in_module
-from .sglang_backend.utils import LogitsProcessorForEAGLE3
+# sglang backend is OPTIONAL. EAGLE3/DFlash HF-backend training never uses the
+# SGLang* target classes below; the installed sglang (dev HEAD) has a different
+# API than this code targets (e.g. scheduler_dp_attn_mixin was removed), so any
+# import failure here must not break training.
+try:
+    import sglang.srt.managers.mm_utils as mm_utils
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+    from sglang.srt.managers.mm_utils import (
+        MultiModalityDataPaddingPatternMultimodalTokens,
+        init_mm_embedding_cache,
+    )
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+        Req,
+        ScheduleBatch,
+    )
+    from sglang.srt.managers.scheduler_dp_attn_mixin import prepare_mlp_sync_batch_raw
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.radix_cache import RadixCache
+    from sglang.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardBatch,
+    )
+    from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+    from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
+
+    from .sglang_backend import (
+        SGLangRunner,
+        wrap_eagle3_logits_processors_in_module,
+    )
+    from .sglang_backend.utils import LogitsProcessorForEAGLE3
+
+    _SGLANG_BACKEND_AVAILABLE = True
+except Exception:  # ImportError or deeper sglang API drift
+    mm_utils = ModelConfig = MRotaryEmbedding = None
+    MultiModalityDataPaddingPatternMultimodalTokens = init_mm_embedding_cache = None
+    Modality = MultimodalDataItem = MultimodalInputs = Req = ScheduleBatch = None
+    prepare_mlp_sync_batch_raw = CacheInitParams = RadixCache = None
+    CaptureHiddenMode = ForwardBatch = BaseMultimodalProcessor = None
+    SamplingParams = ServerArgs = SpeculativeAlgorithm = None
+    require_mlp_sync = require_mlp_tp_gather = None
+    SGLangRunner = wrap_eagle3_logits_processors_in_module = None
+    LogitsProcessorForEAGLE3 = None
+    _SGLANG_BACKEND_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 

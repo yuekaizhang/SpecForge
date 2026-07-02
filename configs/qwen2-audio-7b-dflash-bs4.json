@@ -1,6 +1,6 @@
 {
   "architectures": ["DFlashDraftModel"],
-  "block_size": 6,
+  "block_size": 4,
   "num_hidden_layers": 5,
   "num_target_layers": 32,
   "hidden_size": 4096,

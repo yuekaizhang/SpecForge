@@ -2,7 +2,20 @@ import argparse
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
+try:
+    # Only used for --sglang-attention-backend argparse validation (sglang
+    # backend path). Import lazily so training does not require sglang to be
+    # importable — sglang HEAD pins transformers 5.x, which conflicts with the
+    # transformers version used for HF-backend training.
+    from sglang.srt.server_args import ATTENTION_BACKEND_CHOICES
+except Exception:
+    ATTENTION_BACKEND_CHOICES = [
+        "triton", "torch_native", "flex_attention", "dsa", "nsa", "dsv4",
+        "compressed", "cutlass_mla", "fa3", "fa4", "flashinfer", "flashmla",
+        "trtllm_mla", "cutedsl_mla", "tokenspeed_mla", "trtllm_mha",
+        "dual_chunk_flash_attn", "aiter", "wave", "intel_amx", "ascend",
+        "intel_xpu",
+    ]
 
 
 @dataclass

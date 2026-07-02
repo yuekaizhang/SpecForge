@@ -293,11 +293,53 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         num_proc=args.build_dataset_num_proc,
     )
 
-    min_loss_tokens = 2 * args.block_size
+    # Tight safe lower bound: an anchor needs a full block of `block_size` tokens
+    # after it, so the last block_size-1 loss tokens can't be anchors. Requiring
+    # block_size+1 loss tokens guarantees >=2 anchorable positions (avoids the
+    # "should preprocess the data" crash in _sample_anchor_positions) while
+    # retaining far more short utterances than the old conservative 2*block_size.
+    import json as _json
+
+    min_loss_tokens = args.block_size + 1
     original_size = len(train_eagle3_dataset)
-    train_eagle3_dataset = train_eagle3_dataset.filter(
-        lambda x: x["loss_mask"].sum() >= min_loss_tokens
-    )
+
+    def _enough(m):
+        if isinstance(m, torch.Tensor):
+            return int(m.sum().item()) >= min_loss_tokens
+        # nested list from HF cache: [[0, 0, 1, ...]]
+        flat = m[0] if (isinstance(m, list) and len(m) > 0 and isinstance(m[0], list)) else m
+        return sum(flat) >= min_loss_tokens
+
+    # Cache the kept indices (keyed by dataset cache_key + min_loss_tokens) so
+    # repeated launches (resume / sbatch chaining) skip the multi-minute filter.
+    idx_dir = os.path.join(args.cache_dir, "filtered_indices")
+    idx_path = os.path.join(idx_dir, f"{cache_key}-minloss{min_loss_tokens}.json")
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    if os.path.exists(idx_path):
+        with open(idx_path) as f:
+            kept = _json.load(f)
+        print_on_rank0(
+            f"Loaded cached filter indices: {len(kept)}/{original_size} samples "
+            f"(min_loss_tokens={min_loss_tokens}) from {idx_path}"
+        )
+    else:
+        # Read ONLY the loss_mask column (avoids materializing per-row mel
+        # features, which made the old row-wise .filter() take ~24 min).
+        loss_masks = train_eagle3_dataset["loss_mask"]
+        kept = [i for i, m in enumerate(loss_masks) if _enough(m)]
+        if rank == 0:
+            os.makedirs(idx_dir, exist_ok=True)
+            tmp_path = f"{idx_path}.tmp.{os.getpid()}"
+            with open(tmp_path, "w") as f:
+                _json.dump(kept, f)
+            os.replace(tmp_path, idx_path)
+            print_on_rank0(
+                f"Computed + cached filter indices: {len(kept)}/{original_size} "
+                f"samples -> {idx_path}"
+            )
+
+    train_eagle3_dataset = train_eagle3_dataset.select(kept)
     print_on_rank0(
         f"Filtered train dataset: {original_size} -> {len(train_eagle3_dataset)} samples"
     )
@@ -437,6 +479,7 @@ def main():
             args.draft_config_path = checkpoint_config_path
 
     target_model, draft_model = build_models(args)
+    device = get_local_device()
 
     resume_state = None
     if draft_model_last_checkpoint:
@@ -482,6 +525,7 @@ def main():
     print_on_rank0(f"Total training steps: {total_steps}")
 
     print_on_rank0("Loading target embeddings and head...")
+    device_type = get_local_device().type
     target_components = TargetEmbeddingsAndHead.from_pretrained(
         args.target_model_path,
         embed_key=args.embedding_key,
@@ -549,15 +593,26 @@ def main():
     )
 
     if resume_state is not None:
-        optimizer.load_state_dict(resume_state)
         start_epoch = resume_state["epoch"]
         global_step = resume_state["global_step"]
-        del resume_state
+        # Restore ONLY the LR scheduler (small, rank-agnostic). save_checkpoint
+        # stores the AdamW momentum as rank-0's *sharded* FSDP state; loading it
+        # into every rank passes optimizer.load_state_dict() silently but blows up
+        # at the first optimizer.step() (Adam _foreach_lerp_ size mismatch on
+        # ranks != 0). Trained weights + global_step are already restored and the
+        # LR curve is driven by the scheduler, so we keep a FRESH optimizer
+        # (momentum re-warms within a few steps) but recover the exact LR position.
+        try:
+            optimizer.scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+            optimizer.scheduler.step()  # sync param_group lr to the restored step
+            msg = "restored LR scheduler; FRESH Adam momentum"
+        except Exception as e:
+            msg = f"fresh optimizer+scheduler (scheduler restore failed: {type(e).__name__})"
         print_on_rank0(
-            f"Restored optimizer/scheduler state: "
-            f"epoch={start_epoch}, step={global_step}, "
+            f"Resume ({msg}): epoch={start_epoch}, step={global_step}, "
             f"lr={optimizer.get_learning_rate():.6f}"
         )
+        del resume_state
 
     skip_steps = global_step - start_epoch * len(train_dataloader)
 

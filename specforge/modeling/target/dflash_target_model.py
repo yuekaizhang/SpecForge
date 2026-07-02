@@ -5,21 +5,37 @@ from typing import List, Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
-from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
 from transformers import AutoModelForCausalLM
 
 from specforge.distributed import get_tp_group
 
-from .sglang_backend import SGLangRunner
+# sglang backend is OPTIONAL. HF-backend DFlash training (including audio) never
+# touches these symbols. The installed sglang (dev HEAD) has a different API than
+# this code targets, so import failures here must not break training.
+try:
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.radix_cache import RadixCache
+    from sglang.srt.model_executor.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardBatch,
+    )
+    from sglang.srt.sampling.sampling_params import SamplingParams
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+    from sglang.srt.utils import require_mlp_sync, require_mlp_tp_gather
+
+    from .sglang_backend import SGLangRunner
+
+    _SGLANG_BACKEND_AVAILABLE = True
+except Exception:  # ImportError or deeper sglang API drift
+    ModelConfig = Req = ScheduleBatch = Scheduler = CacheInitParams = None
+    RadixCache = CaptureHiddenMode = ForwardBatch = SamplingParams = None
+    ServerArgs = SpeculativeAlgorithm = None
+    require_mlp_sync = require_mlp_tp_gather = SGLangRunner = None
+    _SGLANG_BACKEND_AVAILABLE = False
 
 
 @dataclass
