@@ -322,8 +322,9 @@ def preprocess_audio_conversations(
     chat_template: ChatTemplate,
     max_length: int = 2048,
     instruction: str = "请将这段音频转写为文本。",
+    strip_whitespace: bool = True,
 ) -> Dict[str, List[torch.Tensor]]:
-    """Preprocess AISHELL-style audio+transcription examples for Qwen2-Audio.
+    """Preprocess audio+transcription examples (Qwen2-Audio, Qwen3-Omni thinker).
 
     examples columns:
         - audio: {"array": np.ndarray, "sampling_rate": int}
@@ -341,11 +342,15 @@ def preprocess_audio_conversations(
         transcription = examples["transcription"][i]
         if not transcription:
             continue
-        # AISHELL (Mandarin) transcripts are space-separated by word segmentation
-        # (e.g. "而 对 楼市"). Strip whitespace so the training target matches the
-        # natural, space-free text the target model actually emits at inference,
-        # reducing the train/inference distribution mismatch.
-        transcription = "".join(transcription.split())
+        if strip_whitespace:
+            # AISHELL (Mandarin) transcripts are space-separated by word
+            # segmentation (e.g. "而 对 楼市"). Strip whitespace so the training
+            # target matches the natural, space-free text the target model
+            # actually emits at inference.
+            transcription = "".join(transcription.split())
+        else:
+            # English (e.g. LibriSpeech): inter-word spaces are meaningful.
+            transcription = transcription.strip()
         conversation = [
             {
                 "role": "user",
@@ -359,10 +364,10 @@ def preprocess_audio_conversations(
         text = processor.apply_chat_template(
             conversation, tokenize=False, add_generation_prompt=False
         )
-        # NOTE: do not pass max_length/truncation here — the Qwen2-Audio processor
-        # would truncate the audio mel features (breaking the fixed 128x3000 shape
-        # the AudioDataCollator relies on). AISHELL transcripts are short; audio is
-        # fixed-length by the Whisper feature extractor.
+        # NOTE: do not pass max_length/truncation here — truncation would corrupt
+        # the audio mel features. Qwen2-Audio mels are fixed 128x3000 (30 s
+        # Whisper padding); Qwen3-Omni mels are VARIABLE-length (~100 frames/s)
+        # and are padded per-batch by AudioDataCollatorWithPadding.
         arr, sr = _to_16k_mono(audio)
         encoding = processor(
             text=text,
@@ -404,6 +409,7 @@ def build_eagle3_dataset(
     is_preformatted: Optional[bool] = False,
     train_only_last_turn: Optional[bool] = False,
     instruction: Optional[str] = None,
+    strip_transcription_whitespace: Optional[bool] = True,
 ) -> HFDataset:
     """
     build eagle3 dataset
@@ -457,6 +463,7 @@ def build_eagle3_dataset(
             audio_kwargs = {}
             if instruction is not None:
                 audio_kwargs["instruction"] = instruction
+            audio_kwargs["strip_whitespace"] = strip_transcription_whitespace
             processed = preprocess_audio_conversations(
                 processor,
                 examples,
@@ -556,6 +563,10 @@ def build_eagle3_dataset(
         batch_size = (
             200  # reduce batch size for VLM datasets to avoid PyArrow offset overflow
         )
+    elif is_audio:
+        # Variable-length float32 mel features (Qwen3-Omni ~100 frames/s) are
+        # ~0.5-2 MB per row; keep Arrow write batches small.
+        batch_size = 200
     else:
         batch_size = 1000  # default for conversations
     dataset = dataset.map(

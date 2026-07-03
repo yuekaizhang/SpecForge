@@ -800,9 +800,11 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
 
 
 class QwenAudioOnlineEagle3Model(Eagle3Model):
-    """Online EAGLE3 training for Qwen2-Audio. Audio is consumed by the target
-    only; the draft is a text-token predictor conditioned on the target's
-    (audio-aware) aux hidden states. Standard 1D RoPE (no M-RoPE)."""
+    """Online EAGLE3 training for audio-conditioned Qwen targets (Qwen2-Audio,
+    Qwen3-Omni thinker). Audio is consumed by the target only; the draft is a
+    text-token predictor over the target's aux hidden states with standard 1D
+    RoPE. The target computes its own positions internally (position_ids is
+    deliberately not passed), so the thinker's M-RoPE is handled correctly."""
 
     def __init__(
         self,

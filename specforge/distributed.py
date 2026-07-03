@@ -122,13 +122,26 @@ def init_distributed(
 
 def destroy_distributed():
     global _TP_GROUP, _DP_GROUP, _SP_ULYSSES_GROUP, _SP_RING_GROUP, _DRAFT_DP_GROUP
-    dist.destroy_process_group(_TP_GROUP)
-    dist.destroy_process_group(_DP_GROUP)
-    dist.destroy_process_group(_SP_ULYSSES_GROUP)
-    dist.destroy_process_group(_SP_RING_GROUP)
-    dist.destroy_process_group(_DRAFT_DP_GROUP)
-    dist.destroy_process_group(_DRAFT_SP_GROUP)
-    dist.destroy_process_group()
+    # Groups may alias each other (e.g. dp == draft_dp at tp=1/sp=1) or already
+    # be gone; a second destroy of the same group raises ValueError("Invalid
+    # process group specified"), turning a fully successful run into a nonzero
+    # torchrun exit AFTER the checkpoint was saved. Best-effort teardown.
+    for _g in (
+        _TP_GROUP,
+        _DP_GROUP,
+        _SP_ULYSSES_GROUP,
+        _SP_RING_GROUP,
+        _DRAFT_DP_GROUP,
+        _DRAFT_SP_GROUP,
+    ):
+        try:
+            dist.destroy_process_group(_g)
+        except Exception:  # ValueError/RuntimeError/AssertionError, group-dependent
+            pass
+    try:
+        dist.destroy_process_group()
+    except Exception:  # AssertionError("Process group cannot be None") when
+        pass  # an aliased group destroy already removed the default group
 
 
 def shard_tensor(

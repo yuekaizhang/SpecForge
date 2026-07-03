@@ -250,7 +250,10 @@ class VlmDataCollatorWithPadding:
 
 
 class AudioDataCollatorWithPadding:
-    """Pads text fields; stacks fixed-size Qwen2-Audio mel features."""
+    """Pads text fields; pads variable-length mel features (Qwen3-Omni,
+    ~100 frames/s) along the frame dim before stacking. For fixed-size
+    Qwen2-Audio 128x3000 mels the pad is zero-width, keeping the old
+    behavior bit-identical."""
 
     def paddingtensor2D(self, intensors, N):
         B, n = intensors.shape
@@ -258,7 +261,10 @@ class AudioDataCollatorWithPadding:
         return torch.cat((intensors, pad), dim=1)
 
     def __call__(self, features):
+        import torch.nn.functional as F
+
         max_length = max(item["input_ids"].shape[1] for item in features)
+        max_mel = max(f["input_features"].shape[-1] for f in features)
         batch = {
             "input_ids": torch.cat(
                 [self.paddingtensor2D(f["input_ids"], max_length) for f in features]
@@ -269,9 +275,25 @@ class AudioDataCollatorWithPadding:
             "loss_mask": torch.cat(
                 [self.paddingtensor2D(f["loss_mask"], max_length) for f in features]
             ),
-            "input_features": torch.cat([f["input_features"] for f in features], dim=0),
+            "input_features": torch.cat(
+                [
+                    F.pad(
+                        f["input_features"],
+                        (0, max_mel - f["input_features"].shape[-1]),
+                    )
+                    for f in features
+                ],
+                dim=0,
+            ),
             "feature_attention_mask": torch.cat(
-                [f["feature_attention_mask"] for f in features], dim=0
+                [
+                    F.pad(
+                        f["feature_attention_mask"],
+                        (0, max_mel - f["feature_attention_mask"].shape[-1]),
+                    )
+                    for f in features
+                ],
+                dim=0,
             ),
             "hidden_state": None,
             "target": None,

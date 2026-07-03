@@ -165,6 +165,33 @@ def build_parser() -> ArgumentParser:
         default="validation",
         help="Split to load when --eval-data-path is an HF dataset id (audio path).",
     )
+    dataset_group.add_argument(
+        "--train-config",
+        type=str,
+        default=None,
+        help="HF dataset config name when --train-data-path is an HF dataset id, "
+        "e.g. 'clean' for openslr/librispeech_asr. Must match the config used "
+        "for label generation so row indices align.",
+    )
+    dataset_group.add_argument(
+        "--eval-config",
+        type=str,
+        default=None,
+        help="HF dataset config name when --eval-data-path is an HF dataset id.",
+    )
+    dataset_group.add_argument(
+        "--text-column",
+        type=str,
+        default="transcription",
+        help="Dataset column holding the transcript (audio path); renamed to "
+        "'transcription' internally. LibriSpeech uses 'text'.",
+    )
+    dataset_group.add_argument(
+        "--keep-transcription-spaces",
+        action="store_true",
+        help="Preserve whitespace in transcriptions (required for English, e.g. "
+        "LibriSpeech). Default strips ALL whitespace (Mandarin/AISHELL-specific).",
+    )
     dataset_group.add_argument("--chat-template", type=str, default="llama3")
     dataset_group.add_argument(
         "--is-preformatted",
@@ -401,15 +428,42 @@ def build_target_model(
     """
     if is_online:
         if args.is_audio:
-            from transformers import Qwen2AudioForConditionalGeneration
+            if (
+                getattr(draft_model_config, "target_model_type", None)
+                == "qwen3_omni_moe"
+            ):
+                # Load the THINKER ONLY (~59 GiB bf16) from the full 65.7 GiB
+                # checkpoint: the class's base_model_prefix='thinker' maps the
+                # 'thinker.'-prefixed weights and skips talker/code2wav.
+                from transformers import Qwen3OmniMoeThinkerForConditionalGeneration
 
-            target_model = (
-                Qwen2AudioForConditionalGeneration.from_pretrained(
-                    args.target_model_path, torch_dtype=torch.bfloat16
+                target_model = (
+                    Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
+                        args.target_model_path, dtype=torch.bfloat16
+                    )
+                    .eval()
+                    .cuda()
                 )
-                .eval()
-                .cuda()
-            )
+                # Tied-head guard (same bug class as the Qwen2-Audio DFlash
+                # incident): there is NO top-level tie_word_embeddings in this
+                # config — the authoritative flag is nested at
+                # thinker_config.text_config.tie_word_embeddings (False), and
+                # the checkpoint ships a real separate thinker.lm_head.weight.
+                assert not target_model.config.get_text_config().tie_word_embeddings
+                assert not torch.equal(
+                    target_model.lm_head.weight,
+                    target_model.model.embed_tokens.weight,
+                ), "Qwen3-Omni thinker lm_head must NOT be tied to embed_tokens"
+            else:
+                from transformers import Qwen2AudioForConditionalGeneration
+
+                target_model = (
+                    Qwen2AudioForConditionalGeneration.from_pretrained(
+                        args.target_model_path, torch_dtype=torch.bfloat16
+                    )
+                    .eval()
+                    .cuda()
+                )
         elif (
             args.is_vlm
             and draft_model_config.target_model_type == "qwen2_5_vl"
@@ -620,6 +674,16 @@ def build_dataloaders(
         cache_params_string += f"-label_override:{args.label_override}"
     if getattr(args, "instruction", None):
         cache_params_string += f"-instruction:{args.instruction}"
+    # New knobs are appended CONDITIONALLY so existing (AISHELL) cache keys
+    # stay valid.
+    if getattr(args, "keep_transcription_spaces", False):
+        cache_params_string += "-keep_spaces"
+    if getattr(args, "text_column", "transcription") != "transcription":
+        cache_params_string += f"-text_column:{args.text_column}"
+    if getattr(args, "train_config", None):
+        cache_params_string += f"-config:{args.train_config}"
+    if getattr(args, "train_split", "train") != "train":
+        cache_params_string += f"-split:{args.train_split}"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
     # The train data path can be either a JSONL file of ShareGPT-style
     # conversations or a `save_to_disk` dataset DIRECTORY (e.g. the audio
@@ -641,12 +705,35 @@ def build_dataloaders(
         from datasets import load_dataset
         from datasets.features import Audio
 
-        train_dataset = load_dataset(args.train_data_path, split=args.train_split)
+        train_dataset = load_dataset(
+            args.train_data_path,
+            getattr(args, "train_config", None),
+            split=args.train_split,
+        )
         train_dataset = train_dataset.cast_column("audio", Audio(decode=False))
+        # Normalize the transcript column name BEFORE the label override: the
+        # audio preprocessing reads 'transcription' (LibriSpeech uses 'text'),
+        # and _replace_label writing a missing column would create a ragged
+        # schema for non-overridden rows.
+        text_column = getattr(args, "text_column", "transcription")
+        if text_column != "transcription":
+            if text_column not in train_dataset.column_names:
+                raise ValueError(
+                    f"--text-column '{text_column}' not found; dataset columns: "
+                    f"{train_dataset.column_names}"
+                )
+            train_dataset = train_dataset.rename_column(text_column, "transcription")
         # Replace GT transcriptions with target model's own generations (from regenerate_labels.py)
         # to eliminate the train/inference distribution mismatch.
         if getattr(args, "label_override", None):
             import json as _json
+
+            if "transcription" not in train_dataset.column_names:
+                raise ValueError(
+                    "--label-override needs an existing 'transcription' column; "
+                    "pass --text-column for datasets whose transcript column "
+                    f"differs (columns: {train_dataset.column_names})"
+                )
 
             label_map = {}
             with open(args.label_override) as _f:
@@ -688,6 +775,9 @@ def build_dataloaders(
             num_proc=args.build_dataset_num_proc,
             train_only_last_turn=args.train_only_last_turn,
             instruction=getattr(args, "instruction", None),
+            strip_transcription_whitespace=not getattr(
+                args, "keep_transcription_spaces", False
+            ),
         )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
@@ -727,8 +817,20 @@ def build_dataloaders(
                 from datasets import load_dataset
                 from datasets.features import Audio
 
-                eval_dataset = load_dataset(args.eval_data_path, split=args.eval_split)
+                eval_dataset = load_dataset(
+                    args.eval_data_path,
+                    getattr(args, "eval_config", None),
+                    split=args.eval_split,
+                )
                 eval_dataset = eval_dataset.cast_column("audio", Audio(decode=False))
+                _text_col = getattr(args, "text_column", "transcription")
+                if (
+                    _text_col != "transcription"
+                    and _text_col in eval_dataset.column_names
+                ):
+                    eval_dataset = eval_dataset.rename_column(
+                        _text_col, "transcription"
+                    )
             else:
                 eval_dataset = Dataset.from_generator(
                     generator=safe_conversations_generator,
@@ -745,6 +847,13 @@ def build_dataloaders(
                 num_proc=args.build_dataset_num_proc,
                 is_preformatted=args.is_preformatted,
                 train_only_last_turn=args.train_only_last_turn,
+                # These were previously omitted, silently making eval fall back
+                # to the Chinese default instruction and Mandarin whitespace
+                # stripping regardless of the train-side settings.
+                instruction=getattr(args, "instruction", None),
+                strip_transcription_whitespace=not getattr(
+                    args, "keep_transcription_spaces", False
+                ),
             )
         elif args.eval_hidden_states_path is not None:
             eval_eagle3_dataset = build_offline_eagle3_dataset(
@@ -1226,6 +1335,17 @@ def main():
                 kl_scale=args.kl_scale,
                 kl_decay=args.kl_decay,
             )
+    fsdp_extra_kwargs = {}
+    if (
+        args.is_audio
+        and getattr(draft_model_config, "target_model_type", None) == "qwen3_omni_moe"
+    ):
+        # Keep the frozen ~59 GiB thinker OUT of the FSDP flat parameter:
+        # flattening it allocates another ~60 GiB in one shot and OOMs on
+        # 80 GB GPUs. The target is frozen and replicated (pure DP), so it
+        # needs no FSDP management; checkpoint saving already filters to
+        # draft keys via filter_draft_state_dict.
+        fsdp_extra_kwargs["ignored_modules"] = [eagle3_model.target_model]
     eagle3_model = FSDP(
         eagle3_model,
         use_orig_params=True,
@@ -1235,6 +1355,7 @@ def main():
         ),
         sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
         process_group=dist.group.WORLD,  # the draft model should run dp for all processes
+        **fsdp_extra_kwargs,
     )
     print_with_rank("Initialized Eagle3 FSDP model")
 
