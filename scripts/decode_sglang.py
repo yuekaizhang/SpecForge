@@ -142,6 +142,12 @@ def main():
         "--prompt",
         default="Detect the language and recognize the speech: <|zh|>",
     )
+    ap.add_argument(
+        "--normalize-english",
+        action="store_true",
+        help="Uppercase + strip punctuation on both GT and hyp before CER "
+        "(LibriSpeech GT is uppercase/unpunctuated; model output is cased).",
+    )
     ap.add_argument("--num-samples", type=int, default=0, help="0=all")
     ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--chunk-size", type=int, default=200)
@@ -228,13 +234,32 @@ def main():
 
         # Phase 3: collect results
         for idx, clip, out in zip(v_indices, v_clips, outputs):
-            gt = "".join(ds[int(idx)][args.text_column].split())
+            if args.normalize_english:
+                # English: keep word spacing; compare case/punct-insensitively.
+                import re as _re
+                import string as _string
+
+                _tbl = str.maketrans("", "", _string.punctuation)
+
+                def _norm_en(s):
+                    return _re.sub(r"\s+", " ", s.upper().translate(_tbl)).strip()
+
+                gt = _norm_en(ds[int(idx)][args.text_column])
+            else:
+                gt = "".join(ds[int(idx)][args.text_column].split())
             if isinstance(out, Exception):
                 hyp, latency = f"ERROR: {out}", 0.0
             else:
                 hyp, latency = out
+            hyp_for_cer = (
+                _norm_en(hyp)
+                if args.normalize_english and not hyp.startswith("ERROR")
+                else hyp
+            )
 
-            cer = compute_cer(gt, hyp) if not hyp.startswith("ERROR") else -1.0
+            cer = (
+                compute_cer(gt, hyp_for_cer) if not hyp.startswith("ERROR") else -1.0
+            )
             rtf = latency / clip["dur"] if clip["dur"] > 0 else 0.0
 
             rec = {
@@ -345,6 +370,17 @@ def main():
         f.write(f"Concurrency:  {args.concurrency}\n\n")
         f.write(f"--- Accuracy ---\n")
         f.write(f"CER:          {mean_cer:.2%}\n")
+        if args.normalize_english:
+            # WER is the standard English ASR metric; corpus-level
+            # (total word errors / total ref words) over normalized text.
+            tot_err = tot_w = 0
+            for r in valid_results:
+                ref = r["gt"].split()
+                hyp_w = _norm_en(r["hyp"]).split()
+                tot_err += _edit_distance(ref, hyp_w)
+                tot_w += len(ref)
+            f.write(f"WER:          {tot_err / max(tot_w, 1):.2%} "
+                    f"({tot_err}/{tot_w} words)\n")
         n_exact = sum(1 for r in valid_results if r["cer"] == 0)
         f.write(
             f"Exact match:  {n_exact}/{len(valid_results)} "
