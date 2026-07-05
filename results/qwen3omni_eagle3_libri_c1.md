@@ -103,3 +103,36 @@ Findings:
    in-domain DATA (e.g. earnings21-train / GigaSpeech / SPGISpeech in the label-regen + training mix).
 
 Artifacts: `outputs/longform/` (clip, GT, result_{baseline,ttt7}.json, serve logs).
+
+## Round 6 — multi-domain drafts (EAGLE3-md @24k steps, DFlash-md bs6 @96k steps)
+
+Training data: outputs/multidomain/combined_train (500,181 utts, 6 domains, labels baked in);
+DFlash filters: min 7 loss tokens + max 3000 mel frames -> 422,800 kept. Serving: tp=1, graph bs=1.
+
+### LibriSpeech clean/test (2620, batch=1)
+| config | accept_len | WER | mean lat | utt/s | speedup |
+|---|---|---|---|---|---|
+| baseline | – | 1.70% | 0.195 s | 5.1 | 1.00× |
+| EAGLE3 single-domain ttt7 (134k steps) | 2.38 | 1.68% | 0.159 s | 6.2 | 1.23× |
+| EAGLE3 multi-domain (24k steps) | 1.61 | 1.68% | 0.214 s | 4.6 | 0.91× |
+| **DFlash multi-domain bs6 (96k steps)** | **3.70** | 1.70% (=baseline, lossless) | **0.128 s** | **7.7** | **1.52×** |
+
+**DFlash-md is the best short-form result on Qwen3-Omni to date**: accept 3.70/7, 1.52×,
+at only 1.88 epochs (loss 0.167 / teacher-forced acc 0.94 at stop).
+
+### earnings21 41-min long-form (vs baseline wall 531.9 s)
+| config | accept_len | wall | vs baseline |
+|---|---|---|---|
+| EAGLE3 single-domain | 1.166 | 575.8 s | 0.92× |
+| EAGLE3 multi-domain (24k) | 1.265 | 537.1 s | 0.99× |
+| DFlash multi-domain (96k) | 1.041 | 622.5 s | 0.85× |
+| DFlash md + --speculative-draft-window-size 1024 | 1.008 | 560.4 s | 0.95× |
+
+**Long-form remains unsolved.** DFlash-md collapses harder than EAGLE3 (retention ratio
+libri->longform: DFlash 0.28 vs EAGLE3-md 0.79). Draft windowing (1024) does NOT recover
+accept — so plain rope-position extrapolation is not the mechanism. Working hypothesis:
+the TARGET's aux hidden-state distribution at 30k+-token context differs from the
+<=30 s-clip training distribution (DFlash conditions on 5 aux layers vs EAGLE3's 3,
+amplifying the shift). Next lever: include LONG-SEQUENCE training samples (raise
+max-audio-frames well beyond 3000 / chunked long-form data / longer max-length),
+not serving-side tricks.
