@@ -41,6 +41,15 @@ class Eagle3DraftModel(PreTrainedModel, ABC):
     the abstract methods to support training with TTT.
     """
 
+    # transformers >=5.x sets `self.all_tied_weights_keys` inside
+    # PreTrainedModel.post_init(), which the Eagle3 draft construction path does
+    # not invoke. Its from_pretrained loader (`_move_missing_keys_from_meta_to_device`)
+    # reads `self.all_tied_weights_keys.keys()` with no default, so resuming from a
+    # checkpoint crashed with AttributeError. Eagle3 draft models tie no weights, so
+    # an empty mapping is the correct value; it is read-only on the load path and is
+    # shadowed by an instance attribute if post_init ever runs.
+    all_tied_weights_keys: dict = {}
+
     @abstractmethod
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         """

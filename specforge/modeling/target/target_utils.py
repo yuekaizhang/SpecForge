@@ -20,23 +20,26 @@ class TargetEmbeddingsAndHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        # Support for MLLMs with separate text_config
-        if hasattr(config, "text_config"):
-            self.embed_tokens = nn.Embedding(
-                config.text_config.vocab_size,
-                config.text_config.hidden_size,
-                padding_idx=config.text_config.pad_token_id,
-            )
-            self.lm_head = nn.Linear(
-                config.text_config.hidden_size,
-                config.text_config.vocab_size,
-                bias=False,
-            )
-        else:
-            self.embed_tokens = nn.Embedding(
-                config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
-            )
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Support MLLMs with a nested text config. get_text_config() recurses
+        # through arbitrary nesting (Qwen2-Audio: config.text_config;
+        # Qwen3-Omni: config.thinker_config.text_config); fall back to the
+        # config itself for plain text models.
+        text_config = None
+        if hasattr(config, "get_text_config"):
+            try:
+                text_config = config.get_text_config()
+            except Exception:
+                text_config = None
+        if text_config is None:
+            text_config = getattr(config, "text_config", None) or config
+        self.embed_tokens = nn.Embedding(
+            text_config.vocab_size,
+            text_config.hidden_size,
+            padding_idx=getattr(text_config, "pad_token_id", None),
+        )
+        self.lm_head = nn.Linear(
+            text_config.hidden_size, text_config.vocab_size, bias=False
+        )
 
     @classmethod
     def from_pretrained(
@@ -74,16 +77,28 @@ class TargetEmbeddingsAndHead(nn.Module):
                 print(f"Warning: Snapshot download failed or path check failed: {e}")
 
         # 3. Handle Weight Tying
-        # For composite / multimodal configs (e.g. Qwen2-Audio), tying of the
-        # *text* LM head is governed by the inner text_config, NOT the top-level
-        # flag. Qwen2-Audio sets top-level tie_word_embeddings=True but
-        # text_config.tie_word_embeddings=False and ships a real untied
-        # language_model.lm_head.weight. Reading the top-level flag here would
-        # silently alias lm_head to embed_tokens and train the draft against the
-        # wrong head, producing accept_length=1.0 at serve time.
+        # For composite / multimodal configs (Qwen2-Audio, Qwen3-Omni), tying of
+        # the *text* LM head is governed by the innermost text config, NOT the
+        # top-level flag. Qwen2-Audio: top-level tie=True but
+        # text_config.tie=False with a real untied language_model.lm_head.
+        # Qwen3-Omni: no top-level flag at all; the truth lives at
+        # thinker_config.text_config.tie_word_embeddings. Reading the wrong
+        # level silently aliases lm_head to embed_tokens and trains the draft
+        # against the wrong head (accept_length=1.0 at serve time).
         tie_weights = getattr(config, "tie_word_embeddings", False)
-        text_config = getattr(config, "text_config", None)
-        if text_config is not None and hasattr(text_config, "tie_word_embeddings"):
+        text_config = None
+        if hasattr(config, "get_text_config"):
+            try:
+                text_config = config.get_text_config()  # recurses nested configs
+            except Exception:
+                text_config = None
+        if text_config is None:
+            text_config = getattr(config, "text_config", None)
+        if (
+            text_config is not None
+            and text_config is not config
+            and hasattr(text_config, "tie_word_embeddings")
+        ):
             tie_weights = getattr(text_config, "tie_word_embeddings")
 
         # 4. Load Weights

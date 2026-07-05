@@ -223,6 +223,15 @@ def build_parser() -> ArgumentParser:
     training_group.add_argument("--batch-size", type=int, default=1)
     training_group.add_argument("--learning-rate", type=float, default=1e-4)
     training_group.add_argument("--max-length", type=int, default=2048)
+    training_group.add_argument(
+        "--max-audio-frames",
+        type=int,
+        default=0,
+        help="If >0 (audio path only), drop training samples whose mel "
+        "feature_attention_mask has more than this many frames (~100 frames/s "
+        "for Qwen3-Omni). Caps per-sample sequence length to avoid CUDA OOM on "
+        "very long utterances (e.g. AMI/Earnings22). 0 disables the filter.",
+    )
     training_group.add_argument("--warmup-ratio", type=float, default=0.015)
     training_group.add_argument(
         "--total-steps",
@@ -620,11 +629,29 @@ def build_draft_model(args: Namespace) -> Tuple[AutoDraftModelConfig, nn.Module]
         is_resume_checkpoint = True
 
     if draft_model_last_checkpoint:
-        draft_model = AutoEagle3DraftModel.from_pretrained(
-            draft_model_last_checkpoint,
+        # transformers 5.x from_pretrained() forces meta-device loading (the
+        # low_cpu_mem_usage=False escape hatch was removed and the kwarg is now
+        # ignored). For this custom Eagle3 draft that meta path leaves params
+        # unmaterialized, producing NaN losses immediately on resume. Build the
+        # model exactly like the fresh path (real-device init, which trains
+        # fine) and load the checkpoint weights explicitly instead.
+        from safetensors.torch import load_file
+
+        draft_model = AutoEagle3DraftModel.from_config(
+            draft_model_config,
             attention_backend=args.attention_backend,
             torch_dtype=torch.bfloat16,
         ).cuda()
+        _state_dict = load_file(
+            os.path.join(draft_model_last_checkpoint, "model.safetensors")
+        )
+        _missing, _unexpected = draft_model.load_state_dict(_state_dict, strict=False)
+        print_on_rank0(
+            f"Resumed draft weights from {draft_model_last_checkpoint}: "
+            f"{len(_state_dict)} tensors loaded, missing={len(_missing)}, "
+            f"unexpected={len(_unexpected)} "
+            f"(embed_tokens is reloaded from the target model below)"
+        )
     else:
         draft_model = AutoEagle3DraftModel.from_config(
             draft_model_config,
@@ -779,6 +806,29 @@ def build_dataloaders(
                 args, "keep_transcription_spaces", False
             ),
         )
+        if args.is_audio and getattr(args, "max_audio_frames", 0) > 0:
+            import numpy as np
+
+            _max_frames = args.max_audio_frames
+
+            def _audio_short_enough(example):
+                # feature_attention_mask is [1, T] (or [T]); last dim = mel frames.
+                return (
+                    np.asarray(example["feature_attention_mask"]).shape[-1]
+                    <= _max_frames
+                )
+
+            _n_before = len(train_eagle3_dataset)
+            train_eagle3_dataset = train_eagle3_dataset.filter(
+                _audio_short_enough,
+                num_proc=args.build_dataset_num_proc,
+                desc=f"filter audio > {_max_frames} mel frames",
+            )
+            _n_after = len(train_eagle3_dataset)
+            print_with_rank(
+                f"max-audio-frames={_max_frames}: kept {_n_after}/{_n_before} "
+                f"train samples (dropped {_n_before - _n_after} long-audio)"
+            )
         vocab_mapping_path = generate_vocab_mapping_file(
             dataset=train_eagle3_dataset,
             target_vocab_size=draft_model_config.vocab_size,

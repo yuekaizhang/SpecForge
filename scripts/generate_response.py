@@ -104,8 +104,10 @@ def main():
                     help="0.0 = greedy")
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--dataset", default="openslr/librispeech_asr")
-    ap.add_argument("--subset", default="clean",
-                    help="dataset config name; MUST also be pinned at training")
+    ap.add_argument("--subset", default=None,
+                    help="dataset config name (e.g. 'clean' for librispeech); "
+                    "MUST also be pinned at training. Default: the dataset's "
+                    "default config.")
     ap.add_argument("--split", default="train.100")
     ap.add_argument("--text-column", default="text")
     ap.add_argument("--id-column", default="id")
@@ -121,10 +123,15 @@ def main():
     print(f"Decoding: temperature={args.temperature} max_tokens={args.max_tokens}")
     print(f"Prompt: {args.prompt!r}")
 
-    from datasets import load_dataset
+    from datasets import load_dataset, load_from_disk
     from datasets.features import Audio
     print(f"Loading {args.dataset} [{args.subset}] split={args.split} ...")
-    ds = load_dataset(args.dataset, args.subset, split=args.split)
+    if os.path.isdir(args.dataset):
+        # save_to_disk directory (e.g. a materialized streamed slice) — subset/
+        # split don't apply; row order is the directory's order (stable idx).
+        ds = load_from_disk(args.dataset)
+    else:
+        ds = load_dataset(args.dataset, args.subset, split=args.split)
     ds = ds.cast_column("audio", Audio(decode=False))
     total = len(ds) if args.num_samples <= 0 else min(args.num_samples, len(ds))
     print(f"Rows: {len(ds)}; processing {total}")

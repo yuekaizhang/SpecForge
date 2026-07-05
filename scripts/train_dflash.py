@@ -133,6 +133,19 @@ def parse_args():
                                help="Target is an audio model (e.g. Qwen2-Audio)")
     dataset_group.add_argument("--instruction", type=str, default=None,
                                help="Audio instruction prompt")
+    dataset_group.add_argument(
+        "--keep-transcription-spaces",
+        action="store_true",
+        help="Preserve whitespace in transcriptions (English). Default strips "
+        "ALL whitespace (Mandarin/AISHELL-specific).",
+    )
+    dataset_group.add_argument(
+        "--max-audio-frames",
+        type=int,
+        default=0,
+        help="Drop samples whose mel feature length exceeds this many frames "
+        "(0 = no limit). Qwen3-Omni mels are ~100 frames/s; 3000 ≈ 30 s.",
+    )
     dataset_group.add_argument("--dataloader-num-workers", type=int, default=8)
     dataset_group.add_argument(
         "--build-dataset-num-proc",
@@ -142,6 +155,12 @@ def parse_args():
 
     training_group = parser.add_argument_group("training")
     training_group.add_argument("--num-epochs", type=int, default=6)
+    training_group.add_argument(
+        "--max-num-steps",
+        type=int,
+        default=None,
+        help="Stop after this many global steps (smoke testing).",
+    )
     training_group.add_argument("--batch-size", type=int, default=1)
     training_group.add_argument("--learning-rate", type=float, default=6e-4)
     training_group.add_argument("--max-length", type=int, default=3072)
@@ -189,12 +208,34 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     device_type = device.type
 
     if args.is_audio:
-        # Audio model: load Qwen2Audio directly, wrap in HFDFlashTargetModel
-        from transformers import Qwen2AudioForConditionalGeneration
-        raw_model = Qwen2AudioForConditionalGeneration.from_pretrained(
-            args.target_model_path, torch_dtype=torch.bfloat16,
-            trust_remote_code=args.trust_remote_code,
-        ).eval().to(device)
+        from transformers import AutoConfig
+
+        _tgt_cfg = AutoConfig.from_pretrained(args.target_model_path)
+        if getattr(_tgt_cfg, "model_type", "") == "qwen3_omni_moe":
+            # Load the THINKER ONLY (~59 GiB bf16); talker/code2wav skipped.
+            from transformers import Qwen3OmniMoeThinkerForConditionalGeneration
+
+            raw_model = (
+                Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
+                    args.target_model_path, dtype=torch.bfloat16
+                )
+                .eval()
+                .to(device)
+            )
+            # Tied-head guard (the Qwen2-Audio DFlash bug class): the tie flag
+            # lives ONLY in the nested thinker_config.text_config (False here);
+            # the checkpoint ships a real separate thinker.lm_head.weight.
+            assert not raw_model.config.get_text_config().tie_word_embeddings
+            assert not torch.equal(
+                raw_model.lm_head.weight, raw_model.model.embed_tokens.weight
+            ), "Qwen3-Omni thinker lm_head must NOT be tied to embed_tokens"
+        else:
+            # Qwen2-Audio path (unchanged)
+            from transformers import Qwen2AudioForConditionalGeneration
+            raw_model = Qwen2AudioForConditionalGeneration.from_pretrained(
+                args.target_model_path, torch_dtype=torch.bfloat16,
+                trust_remote_code=args.trust_remote_code,
+            ).eval().to(device)
         target_model = HFDFlashTargetModel(raw_model)
     else:
         target_model_kwargs = {}
@@ -263,9 +304,25 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
     )
     if getattr(args, "instruction", None):
         cache_params_string += f"-instruction:{args.instruction}"
+    # Keep the suffix ORDER identical to train_eagle3.py's build_dataloaders so
+    # the md5 matches and the (multi-hour) preprocessed cache is SHARED between
+    # EAGLE3 and DFlash training on the same data/args.
+    if getattr(args, "keep_transcription_spaces", False):
+        cache_params_string += "-keep_spaces"
     cache_key = hashlib.md5(cache_params_string.encode()).hexdigest()
 
-    if getattr(args, "is_audio", False) and not (
+    if os.path.isdir(args.train_data_path) and (
+        os.path.exists(os.path.join(args.train_data_path, "dataset_info.json"))
+        or os.path.exists(os.path.join(args.train_data_path, "state.json"))
+    ):
+        # save_to_disk directory (e.g. outputs/multidomain/combined_train with
+        # regenerated labels baked into 'transcription')
+        from datasets import load_from_disk
+        from datasets.features import Audio
+
+        train_dataset = load_from_disk(args.train_data_path)
+        train_dataset = train_dataset.cast_column("audio", Audio(decode=False))
+    elif getattr(args, "is_audio", False) and not (
         os.path.isfile(args.train_data_path) or os.path.isdir(args.train_data_path)
     ):
         from datasets.features import Audio
@@ -288,6 +345,9 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         is_audio=getattr(args, "is_audio", False),
         processor=processor,
         instruction=getattr(args, "instruction", None),
+        strip_transcription_whitespace=not getattr(
+            args, "keep_transcription_spaces", False
+        ),
         cache_dir=os.path.join(args.cache_dir, "processed_dataset"),
         cache_key=cache_key,
         num_proc=args.build_dataset_num_proc,
@@ -310,10 +370,16 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
         flat = m[0] if (isinstance(m, list) and len(m) > 0 and isinstance(m[0], list)) else m
         return sum(flat) >= min_loss_tokens
 
-    # Cache the kept indices (keyed by dataset cache_key + min_loss_tokens) so
-    # repeated launches (resume / sbatch chaining) skip the multi-minute filter.
+    # Cache the kept indices (keyed by cache_key + filter params) so repeated
+    # launches (resume / sbatch chaining) skip the multi-minute filter. The
+    # single pass also enforces --max-audio-frames (drop very long AMI/
+    # Earnings22 clips whose variable-length omni mels OOM at batch 1).
+    max_audio_frames = int(getattr(args, "max_audio_frames", 0) or 0)
     idx_dir = os.path.join(args.cache_dir, "filtered_indices")
-    idx_path = os.path.join(idx_dir, f"{cache_key}-minloss{min_loss_tokens}.json")
+    idx_name = f"{cache_key}-minloss{min_loss_tokens}"
+    if max_audio_frames > 0:
+        idx_name += f"-maxframes{max_audio_frames}"
+    idx_path = os.path.join(idx_dir, f"{idx_name}.json")
     rank = dist.get_rank() if dist.is_initialized() else 0
 
     if os.path.exists(idx_path):
@@ -321,13 +387,28 @@ def build_dataloader(args, tokenizer) -> Tuple[DataLoader, Optional[DataLoader]]
             kept = _json.load(f)
         print_on_rank0(
             f"Loaded cached filter indices: {len(kept)}/{original_size} samples "
-            f"(min_loss_tokens={min_loss_tokens}) from {idx_path}"
+            f"(min_loss_tokens={min_loss_tokens}, max_audio_frames="
+            f"{max_audio_frames or 'off'}) from {idx_path}"
         )
     else:
-        # Read ONLY the loss_mask column (avoids materializing per-row mel
-        # features, which made the old row-wise .filter() take ~24 min).
+        # Column-only reads (avoid materializing per-row mel features, which
+        # made the old row-wise .filter() take ~24 min).
         loss_masks = train_eagle3_dataset["loss_mask"]
         kept = [i for i, m in enumerate(loss_masks) if _enough(m)]
+        if max_audio_frames > 0:
+            fams = train_eagle3_dataset["feature_attention_mask"]
+
+            def _frames(fam):
+                if isinstance(fam, torch.Tensor):
+                    return fam.shape[-1]
+                flat = (
+                    fam[0]
+                    if (isinstance(fam, list) and fam and isinstance(fam[0], list))
+                    else fam
+                )
+                return len(flat)
+
+            kept = [i for i in kept if _frames(fams[i]) <= max_audio_frames]
         if rank == 0:
             os.makedirs(idx_dir, exist_ok=True)
             tmp_path = f"{idx_path}.tmp.{os.getpid()}"
@@ -696,6 +777,14 @@ def main():
                 save_checkpoint(
                     args, epoch, global_step, dflash_model, draft_model, optimizer
                 )
+
+            if (
+                args.max_num_steps is not None
+                and global_step >= args.max_num_steps
+            ):
+                break
+        if args.max_num_steps is not None and global_step >= args.max_num_steps:
+            break
 
     save_checkpoint(
         args, args.num_epochs, global_step, dflash_model, draft_model, optimizer
