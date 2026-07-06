@@ -518,6 +518,19 @@ class LlamaYarnRotaryEmbedding(LlamaRotaryEmbedding):
         )
 
 
+def _resolve_rope_theta(config, default=10000):
+    """transformers 5.x moved rope_theta into config.rope_parameters and stopped
+    exposing the attribute, so a bare getattr(config, "rope_theta", 10000)
+    silently falls back to 10000 and trains a draft whose rope base disagrees
+    with what sglang serves (it reads rope_parameters -> e.g. 1e6 for
+    Qwen3-Omni). Resolve rope_parameters first."""
+    rope_params = getattr(config, "rope_parameters", None)
+    if isinstance(rope_params, dict) and rope_params.get("rope_theta") is not None:
+        return rope_params["rope_theta"]
+    rope_theta = getattr(config, "rope_theta", None)
+    return rope_theta if rope_theta is not None else default
+
+
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -553,7 +566,7 @@ class LlamaAttention(nn.Module):
             self.rotary_emb = LlamaRotaryEmbedding(
                 self.head_dim,
                 max_position_embeddings=self.max_position_embeddings,
-                base=getattr(self.config, "rope_theta", 10000),
+                base=_resolve_rope_theta(self.config),
             )
         else:
             rope_scaling = self.config.rope_scaling
@@ -570,7 +583,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=_resolve_rope_theta(self.config),
                 )
                 return
             elif scaling_type == "linear":
@@ -598,7 +611,7 @@ class LlamaAttention(nn.Module):
                 self.rotary_emb = LlamaRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
-                    base=getattr(self.config, "rope_theta", 10000),
+                    base=_resolve_rope_theta(self.config),
                     scaling_factor=(
                         scaling_factor if scaling_factor is not None else 1.0
                     ),
