@@ -136,3 +136,109 @@ the TARGET's aux hidden-state distribution at 30k+-token context differs from th
 amplifying the shift). Next lever: include LONG-SEQUENCE training samples (raise
 max-audio-frames well beyond 3000 / chunked long-form data / longer max-length),
 not serving-side tricks.
+
+## Round 7 — mature multi-domain checkpoints (EAGLE3-md @632k / 10 ep, DFlash-md @528k / 10 ep)
+
+Same serving recipe as Round 6 (tp=1, graph bs=1, batch=1, LibriSpeech clean/test 2620).
+
+| config | accept_len | WER | mean lat | utt/s | speedup |
+|---|---|---|---|---|---|
+| baseline | – | 1.70% | 0.195 s | 5.1 | 1.00× |
+| EAGLE3-md epoch_10_step_632000 | 2.49 | 1.68% | 0.155 s | 6.4 | 1.26× |
+| DFlash-md bs6 epoch_1_step_96000 (Round 6) | 3.70 | 1.70% | 0.128 s | 7.7 | 1.52× |
+| **DFlash-md bs6 epoch_9_step_528000** | **4.15** | 1.70% (=baseline, lossless) | **0.120 s** | **8.2** | **1.63×** |
+
+DFlash keeps improving with training: 96k→528k steps (1.9→10 epochs) lifts accept
+3.70→4.15 (mean over 418 decode-log intervals; per-interval spread ~3.7–4.8) and
+speedup 1.52×→1.63×. WER/CER/exact-match identical to baseline — still lossless.
+Wall 340.6 s→321.2 s for the full test set. Accept 4.15 of a 7-token budget
+(block 6 + bonus) suggests diminishing but not exhausted headroom; the remaining
+gap to ceiling is mostly hard tokens (proper nouns / first token after prefill).
+
+### Round 7 long-form (earnings21 41-min, vs baseline wall 531.9 s)
+| config | accept_len | wall | vs baseline |
+|---|---|---|---|
+| DFlash-md 96k (Round 6) | 1.041 | 622.5 s | 0.85× |
+| DFlash-md 528k (10 ep) | 1.031 | 628.6 s | 0.85× |
+
+**OOD long-form is NOT recovered by more short-clip training** — 5.5× more steps
+(96k→528k) moved libri accept 3.70→4.15 but long-form stayed at ~1.03 (628.6 s,
+15% slower than baseline). Mirrors the EAGLE3-md finding (24k→632k: 1.27→1.19).
+Short-clip volume is orthogonal to the 30k+-context aux-hidden-state shift;
+the lever remains LONG-SEQUENCE training data.
+
+## Round 8 — ROOT CAUSE: train/serve rope-theta mismatch (transformers 5.8.1)
+
+`transformers` 5.8.1 moved `rope_theta` into `config.rope_parameters` and stopped
+exposing the attribute. SpecForge's `getattr(config, "rope_theta", 10000)` silently
+fell back to **10000** at training time, while sglang serving reads
+`rope_parameters` → **1e6** (Qwen3-Omni thinker value in our draft configs).
+Every Qwen3-Omni EAGLE3 draft (1- and 2-layer) trained with base 10000 but served
+at 1e6. DFlash is unaffected (its qwen3-arch draft uses transformers' Qwen3
+classes, which read rope_parameters correctly).
+
+Evidence: weight-level parity test (same ckpt, SpecForge forward vs hand-written
+sglang fused-residual semantics, fp32): base 10000 → max diff 1.4e-6 (exact);
+base 1e6 → max diff 0.19. The 2-layer SpecForge implementation itself is exactly
+equivalent to sglang's — no modeling bug.
+
+Fixes:
+- SpecForge `_init_rope` now resolves `rope_parameters.rope_theta` first (future
+  training matches serving with no config hack).
+- Existing checkpoints: serve with a config copy setting rope_theta/rope_parameters
+  to 10000 (`*_rope10k` dirs, model.safetensors symlinked) — no retrain needed.
+
+### LibriSpeech clean/test, matched-rope serving (tp=1, graph bs=1, batch=1)
+| config | accept_len | WER | mean lat | utt/s | speedup |
+|---|---|---|---|---|---|
+| baseline | – | 1.70% | 0.195 s | 5.1 | 1.00× |
+| EAGLE3-md 1-layer 632k, rope MISMATCHED (old) | 2.49 | 1.68% | 0.155 s | 6.4 | 1.26× |
+| **EAGLE3-md 1-layer 632k, rope10k** | **3.12** | 1.68% | **0.131 s** | **7.5** | **1.49×** |
+| EAGLE3 2-layer 336k, rope MISMATCHED | 1.63 | 1.68% | 0.211 s | 4.7 | 0.92× |
+| EAGLE3 2-layer 336k, rope10k | 1.92 | 1.67% | 0.185 s | 5.3 | 1.05× |
+| DFlash-md bs6 528k (unaffected) | 4.15 | 1.70% | 0.120 s | 8.2 | 1.63× |
+
+The rope fix is a free +0.63 accept / 1.26×→1.49× on the existing 1-layer draft.
+2-layer at 336k/5.4 ep still trails the 1-layer trajectory under matched-rope
+serving; open question whether it is training maturity or a residual multi-layer
+TTT-dynamics gap. NOTE: the running 2-layer sbatch chain must be cancelled —
+resuming 10000-trained weights under the fixed code (1e6) would corrupt it;
+restart fresh so 2-layer trains at 1e6 end-to-end.
+
+### Round 8 long-form (earnings21 41-min, 1-layer 632k rope10k)
+accept 1.090, wall 610.7 s vs baseline 531.9 s (0.87×). Matching the rope base does
+NOT recover long-form — collapse is confirmed to be the aux-hidden distribution
+shift at 30k+ context (short-clip drafts have no training signal at those
+positions under ANY base). The lever remains long-sequence training data; the
+1e6 code fix is a prerequisite (shares the target's positional geometry) but not
+sufficient.
+
+## Round 9 — batch (concurrency) scaling, default CUDA graph, 1 GPU
+
+Question: does spec decoding still pay at batch >1, and does removing the
+`--cuda-graph-max-bs-decode 1` cap OOM? Setup: tp=1, mem-fraction 0.85, DEFAULT
+graph config (decode graphs captured up to bs=256), LibriSpeech clean/test 2620.
+**No OOM for baseline, EAGLE3, or DFlash** — full graph capture fits at 0.85.
+EAGLE3 = 1-layer 632k rope10k (steps=3/topk=1/draft-tokens=4); DFlash = 528k bs6.
+(c8 EAGLE3 cell re-run solo — the first pass was skewed by the three sweep
+clients sharing CPU for audio encoding.)
+
+| conc | baseline wall / thr | EAGLE3 wall / thr / accept / speedup | DFlash wall / thr / accept / speedup |
+|---|---|---|---|
+| 1* | 514 s / 5.1 | 350.3 s / 7.5 / 3.12 / **1.47×** | 321.2 s / 8.2 / 4.15 / **1.60×** |
+| 2 | 408.3 s / 6.4 | 284.1 s / 9.2 / 3.15 / **1.44×** | 259.3 s / 10.1 / 4.22 / **1.57×** |
+| 4 | 333.0 s / 7.9 | 233.5 s / 11.2 / 3.17 / **1.43×** | 207.8 s / 12.6 / 4.24 / **1.60×** |
+| 8 | 264.0 s / 9.9 | 179.1 s / 14.6 / 3.19 / **1.47×** | 164.1 s / 16.0 / 4.29 / **1.61×** |
+| 16 | 212.0 s / 12.4 | 157.7 s / 16.6 / 3.18 / **1.34×** | 145.2 s / 18.0 / 4.22 / **1.46×** |
+
+*c1 from Rounds 7-8 (graph capped at bs1; consistent with the sweep).
+WER 1.67-1.70% everywhere (lossless).
+
+- Accept length is FLAT vs concurrency (EAGLE3 ~3.15, DFlash ~4.2) — batching
+  doesn't degrade draft quality, as expected (per-request drafting).
+- Speedup holds ~constant through c8 and dips mildly at c16 (1.47→1.34 EAGLE3,
+  1.61→1.46 DFlash): the 48-layer MoE target is launch-latency-bound at small
+  batch, so verifying k tokens per step is nearly free; by c16 the GPU starts
+  to be throughput-bound and the extra verify FLOPs begin to cost.
+- Best single-GPU serving point so far: DFlash bs6 @ c16 = 18.0 utt/s lossless
+  (2620 utts in 145 s).
