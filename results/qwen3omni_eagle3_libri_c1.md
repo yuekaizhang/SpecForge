@@ -242,3 +242,96 @@ WER 1.67-1.70% everywhere (lossless).
   to be throughput-bound and the extra verify FLOPs begin to cost.
 - Best single-GPU serving point so far: DFlash bs6 @ c16 = 18.0 utt/s lossless
   (2620 utts in 145 s).
+
+## Round 10 — per-utterance speedup vs utterance length (DFlash, c=8, 1 GPU)
+
+Question: does speculative speedup shrink for short utterances, where the
+(unaccelerated) audio prefill dominates end-to-end latency? Setup: paired
+decode of LibriSpeech clean/test (2620 utts) at concurrency 8 on 1 GPU with
+default CUDA graphs — DFlash-md bs6 @528k (wall 164.5 s) vs baseline
+(wall 258.8 s). `decode_sglang.py` now records per-request
+`gt_words / audio_dur_s / completion_tokens / prompt_tokens / spec_verify_ct`
+(via `return_meta_info`), so per-request accept = completion_tokens /
+spec_verify_ct (tokens per target decode forward; counts the prefill bonus
+token, hence reads higher than the server's per-step interval metric).
+Speedup is paired per utterance: baseline latency / DFlash latency.
+
+| GT words | n | mean speedup | median | accept len |
+|---|---|---|---|---|
+| 1-10 | 733 | 1.41 | 1.35 | 4.76 |
+| 11-20 | 902 | 1.69 | 1.64 | 5.01 |
+| 21-30 | 481 | 1.79 | 1.76 | 5.13 |
+| 31-40 | 270 | 1.82 | 1.79 | 5.10 |
+| 41-50 | 139 | 1.85 | 1.83 | 5.02 |
+| 51-70 | 79 | 1.81 | 1.83 | 4.88 |
+| 71+ | 16 | 1.43 | 1.45 | 3.67 |
+
+![speedup vs words](omni_libri_paired_c8/speedup_vs_words.png)
+
+- **Hypothesis confirmed**: 1-10-word utterances get 1.41× vs 1.81× for
+  21-50 words. Prefill (audio encoder + 30B prefill pass) is untouched by
+  spec decoding, and short clips spend proportionally more of their latency
+  there; their accept is also slightly lower (4.76) because the fixed
+  per-request warmup (first verify after prefill, EOS truncation of the last
+  block) weighs more when there are only ~15 decode tokens.
+- Speedup plateaus at ~1.8× from ~20 words on — decode-dominated regime.
+- The 71+ bin (n=16, LibriSpeech's longest paragraphs) dips again for a
+  different reason: accept itself drops to 3.67 — an early hint of the
+  long-context accept decay seen at scale on earnings21.
+- Caveat: c=8 latencies carry queueing jitter (scatter spread), but pairing
+  by utterance and binning (n≥79 for all but the last bin) averages it out;
+  mean and median tracks agree.
+
+## Round 11 — OOD short-utterance test: open-asr-leaderboard common_voice (first 3000)
+
+Setup: hf-audio/open-asr-leaderboard, `common_voice` subset, first 3000 of 16334
+test rows (mean 11.7 words / 9.2 s audio — a SHORT-utterance, accented,
+crowd-read OOD set covered by NONE of the training mixes). c=8, 1 GPU, default
+graphs. EAGLE3 drafts served with matched rope (rope10k copies). Accept is the
+per-request metric (completion_tokens / verify steps; reads ~0.8 higher than
+the server per-step metric).
+
+| config | wall | WER | accept (per-req) | mean lat | utt/s | speedup |
+|---|---|---|---|---|---|---|
+| baseline | 244.3 s | 7.25% | – | 0.632 s | 12.3 | 1.00× |
+| EAGLE3 single-domain (libri-only, 134k, rope10k) | 207.0 s | 7.25% | 2.11 | 0.533 s | 14.5 | 1.18× |
+| EAGLE3 multi-domain (632k, rope10k) | 190.8 s | 7.25% | 2.67 | 0.489 s | 15.7 | 1.28× |
+| **DFlash multi-domain (528k)** | **179.4 s** | 7.25% | **3.28** | **0.458 s** | **16.7** | **1.36×** |
+
+- All lossless (WER 7.25% = baseline across the board).
+- **Multi-domain beats single-domain on OOD by +27% accept** (2.67 vs 2.11) at
+  identical architecture/serving — domain diversity in training transfers.
+- Ranking unchanged from in-domain: DFlash > EAGLE3-md > EAGLE3-sd.
+- The OOD speedup drop vs LibriSpeech c8 (DFlash 1.61×→1.36×) compounds TWO
+  effects: (1) accept drop (per-req ~5.0→3.28, retention ~0.66); (2) the
+  Round-10 length effect — at a mean of 11.7 words, even the in-domain 11-20w
+  bin only reaches ~1.69×, so roughly half the gap is the short-utterance
+  prefill share, not OOD accept.
+
+## Round 12 — DFlash across open-asr-leaderboard subsets (c=8, 1 GPU)
+
+Same serving as Round 11 (DFlash-md bs6 @528k, default graphs). Full test
+subsets: earnings22 2741 utts (9.1 s avg), voxpopuli 1842 (9.6 s),
+librispeech test.other 2939 (8.3 s). Accept = per-request metric.
+
+| subset | in mix? | baseline wall / WER | DFlash wall / WER | accept | speedup |
+|---|---|---|---|---|---|
+| librispeech test.clean (R9) | yes | 264.0 s / 1.70% | 164.1 s / 1.70% | ~5.0 | **1.61×** |
+| librispeech test.other | domain yes (harder acoustics) | 263.3 s / 2.89% | 159.0 s / 2.89% | 4.38 | **1.66×** |
+| earnings22 (short segs) | yes | 247.9 s / 18.08% | 154.6 s / 18.07% | 4.55 | **1.60×** |
+| voxpopuli | yes (4k utts only) | 198.9 s / 7.87% | 122.3 s / 7.85% | 4.36 | **1.63×** |
+| common_voice (R11) | NO | 244.3 s / 7.25% | 179.4 s / 7.25% | 3.28 | 1.36× |
+
+- **Covered domains all hold ~1.6×** (1.60-1.66×) regardless of acoustic
+  difficulty: test.other's higher WER (2.89% vs 1.70%) costs no accept — the
+  draft tracks the target's output distribution, not audio quality. Even
+  voxpopuli, with only 4k training utts in the 500k mix, holds 4.36.
+- earnings22 SHORT segments accept 4.55 vs the 41-min earnings21 clip's ~1.03:
+  same domain, wildly different accept — more evidence the long-form collapse
+  is sequence-length distribution shift, not lexical/domain content.
+- The only real drop remains truly-unseen common_voice (3.28 / 1.36×), and per
+  Round 11 about half of that gap is its very short utterances (11.7 words
+  mean), not accept.
+- WER deltas between baseline and DFlash are ≤0.02 pp (a couple of words in
+  50k+), i.e. batching-order numerical noise at temperature 0 — lossless in
+  practice on every subset.

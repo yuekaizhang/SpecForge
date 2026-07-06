@@ -82,12 +82,19 @@ def encode_audio_b64(audio_bytes: bytes) -> Tuple[str, float]:
 
 # ===================== Async HTTP =====================
 async def decode_one(session, url, model, prompt, audio_b64, sem):
-    """Send one request, return (generated_text, latency_s)."""
+    """Send one request, return (generated_text, latency_s, stats).
+
+    stats carries usage.completion_tokens / prompt_tokens plus, when
+    speculative decoding is on, meta_info.spec_verify_ct (requested via
+    return_meta_info) so per-request accept length can be derived as
+    completion_tokens / spec_verify_ct.
+    """
     async with sem:
         payload = {
             "model": model,
             "temperature": 0,
             "max_tokens": 200,
+            "return_meta_info": True,
             "messages": [
                 {
                     "role": "user",
@@ -109,10 +116,17 @@ async def decode_one(session, url, model, prompt, audio_b64, sem):
                 data = await resp.json()
                 latency = time.monotonic() - t0
                 if "choices" in data:
-                    return data["choices"][0]["message"]["content"], latency
-                return f"ERROR: {json.dumps(data)[:200]}", latency
+                    usage = data.get("usage") or {}
+                    meta = data["choices"][0].get("meta_info") or {}
+                    stats = {
+                        "completion_tokens": usage.get("completion_tokens"),
+                        "prompt_tokens": usage.get("prompt_tokens"),
+                        "spec_verify_ct": meta.get("spec_verify_ct"),
+                    }
+                    return data["choices"][0]["message"]["content"], latency, stats
+                return f"ERROR: {json.dumps(data)[:200]}", latency, {}
         except Exception as e:
-            return f"ERROR: {e}", time.monotonic() - t0
+            return f"ERROR: {e}", time.monotonic() - t0, {}
 
 
 async def decode_batch(server_url, model, prompt, clips, concurrency):
@@ -248,9 +262,9 @@ def main():
             else:
                 gt = "".join(ds[int(idx)][args.text_column].split())
             if isinstance(out, Exception):
-                hyp, latency = f"ERROR: {out}", 0.0
+                hyp, latency, req_stats = f"ERROR: {out}", 0.0, {}
             else:
-                hyp, latency = out
+                hyp, latency, req_stats = out
             hyp_for_cer = (
                 _norm_en(hyp)
                 if args.normalize_english and not hyp.startswith("ERROR")
@@ -262,6 +276,8 @@ def main():
             )
             rtf = latency / clip["dur"] if clip["dur"] > 0 else 0.0
 
+            ct = req_stats.get("completion_tokens")
+            vct = req_stats.get("spec_verify_ct")
             rec = {
                 "idx": int(idx),
                 "gt": gt,
@@ -270,6 +286,11 @@ def main():
                 "audio_dur_s": round(clip["dur"], 3),
                 "latency_s": round(latency, 3),
                 "rtf": round(rtf, 4),
+                "gt_words": len(gt.split()),
+                "completion_tokens": ct,
+                "prompt_tokens": req_stats.get("prompt_tokens"),
+                "spec_verify_ct": vct,
+                "accept_len": round(ct / vct, 3) if ct and vct else None,
             }
             all_results.append(rec)
             f_results.write(json.dumps(rec, ensure_ascii=False) + "\n")
