@@ -534,7 +534,7 @@ def _resolve_rope_theta(config, default=10000):
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config):
+    def __init__(self, config, qkv_input_dim=None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -547,14 +547,18 @@ class LlamaAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = config.max_position_embeddings
 
+        # Eagle3's INPUT layer consumes cat(embeds, target_hidden) -> 2*H;
+        # deeper layers of a multi-layer draft consume plain H.
+        if qkv_input_dim is None:
+            qkv_input_dim = self.hidden_size * 2
         self.q_proj = nn.Linear(
-            self.hidden_size * 2, self.num_heads * self.head_dim, bias=False
+            qkv_input_dim, self.num_heads * self.head_dim, bias=False
         )
         self.k_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            qkv_input_dim, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.v_proj = nn.Linear(
-            self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False
+            qkv_input_dim, self.num_key_value_heads * self.head_dim, bias=False
         )
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim, self.hidden_size, bias=False
@@ -1269,8 +1273,8 @@ class LlamaFlashAttention(LlamaAttention):
         - cache_hidden: manual cache used for storing past key and value states
     """
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, qkv_input_dim=None):
+        super().__init__(config, qkv_input_dim=qkv_input_dim)
         if (
             _std_flash_attn_varlen_func is None
             or _std_flash_attn_varlen_backward is None
@@ -1353,8 +1357,8 @@ class LlamaUSPFlashAttention(LlamaAttention):
     LlamaUSPFlashAttention with Trainable Ring Attention & Correct Eagle3 Branch Merging.
     """
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, qkv_input_dim=None):
+        super().__init__(config, qkv_input_dim=qkv_input_dim)
         assert (
             dist.is_initialized()
         ), f"LlamaUSPAttention requires torch.distributed; call init_distributed first."
@@ -1555,19 +1559,33 @@ class LlamaRMSNorm(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config, attention_backend: str = "sdpa"):
+    def __init__(self, config, attention_backend: str = "sdpa", layer_id: int = 0):
         super().__init__()
         self.hidden_size = config.hidden_size
+        # Layer 0 consumes cat(embeds, fc(target_hidden)) -> qkv input 2*H;
+        # deeper layers of a multi-layer draft consume plain H. Mirrors
+        # sglang's llama_eagle3.py `is_input_layer` semantics exactly.
+        self.layer_id = layer_id
+        self.is_input_layer = layer_id == 0
+        qkv_input_dim = (
+            config.hidden_size * 2 if self.is_input_layer else config.hidden_size
+        )
 
         if attention_backend == "sdpa":
-            self.self_attn = LlamaAttention(config=config)
+            self.self_attn = LlamaAttention(config=config, qkv_input_dim=qkv_input_dim)
         elif attention_backend == "flex_attention":
             print_with_rank("Using flex attention on draft model training!")
-            self.self_attn = LlamaFlexAttention(config=config)
+            self.self_attn = LlamaFlexAttention(
+                config=config, qkv_input_dim=qkv_input_dim
+            )
         elif attention_backend == "fa":
-            self.self_attn = LlamaFlashAttention(config=config)
+            self.self_attn = LlamaFlashAttention(
+                config=config, qkv_input_dim=qkv_input_dim
+            )
         elif attention_backend == "usp":
-            self.self_attn = LlamaUSPFlashAttention(config=config)
+            self.self_attn = LlamaUSPFlashAttention(
+                config=config, qkv_input_dim=qkv_input_dim
+            )
         else:
             raise ValueError(f"Unknown attention backend {attention_backend}")
 
@@ -1611,10 +1629,17 @@ class LlamaDecoderLayer(nn.Module):
 
         residual = hidden_states
 
-        hidden_states = self.hidden_norm(hidden_states)
-        input_emb = self.input_layernorm(input_emb)
+        if self.is_input_layer:
+            # Input layer: pre-norm both streams, then concat -> 2*H qkv.
+            hidden_states = self.hidden_norm(hidden_states)
+            input_emb = self.input_layernorm(input_emb)
+            hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+        else:
+            # Deeper layers: standard pre-norm on the running hidden stream
+            # (input_emb is not consumed again). Matches sglang llama_eagle3's
+            # fused hidden_norm(hidden, residual) semantics in unfused form.
+            hidden_states = self.hidden_norm(hidden_states)
 
-        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
         # Self Attention
         hidden_states = self.self_attn(
             cache_hidden=cache_hidden,
@@ -1651,7 +1676,25 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, config.pad_token_id
         )
-        self.midlayer = LlamaDecoderLayer(config, attention_backend=attention_backend)
+        # Multi-layer draft: layer count comes from config.num_hidden_layers
+        # (historically hardcoded to a single `midlayer`). Weights are saved as
+        # `layers.N.*`, which sglang's llama_eagle3 loads natively (it also
+        # keeps a legacy "midlayer"->"layers.0" remap for old checkpoints).
+        self.num_layers = getattr(config, "num_hidden_layers", 1) or 1
+        if attention_backend == "flex_attention" and self.num_layers > 1:
+            # flex attention's DynamicCache path hardcodes layer_idx=0
+            raise NotImplementedError(
+                "flex_attention backend does not support multi-layer drafts yet; "
+                "use sdpa/fa/usp"
+            )
+        self.layers = nn.ModuleList(
+            [
+                LlamaDecoderLayer(
+                    config, attention_backend=attention_backend, layer_id=i
+                )
+                for i in range(self.num_layers)
+            ]
+        )
 
         if hasattr(config, "target_hidden_size"):
             self.fc = torch.nn.Linear(
@@ -1693,7 +1736,8 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
             cache_hidden = None
         else:
             print_with_rank(f"using ttt_length {ttt_length}, caching hidden states")
-            cache_hidden = [[], []]
+            # one K/V cache per draft layer
+            cache_hidden = [[[], []] for _ in range(self.num_layers)]
 
         batch_size, seq_length, _ = hidden_states.size()
 
@@ -1713,16 +1757,17 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
 
         # fc
         hidden_states = self.fc(hidden_states)
-        hidden_states = self.midlayer(
-            input_emb=inputs_embeds,
-            hidden_states=hidden_states,
-            cache_hidden=cache_hidden,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=None,
-            output_attentions=False,
-            use_cache=False,
-        )
+        for i, layer in enumerate(self.layers):
+            hidden_states = layer(
+                input_emb=inputs_embeds,
+                hidden_states=hidden_states,
+                cache_hidden=cache_hidden[i] if cache_hidden is not None else None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=None,
+                output_attentions=False,
+                use_cache=False,
+            )
 
         # norm
         hidden_states = self.norm(hidden_states)
@@ -1751,13 +1796,32 @@ class LlamaForCausalLMEagle3(Eagle3DraftModel):
         past_key_values: Optional[Cache] = None,
         use_cache: bool = True,
     ) -> torch.Tensor:
-        return self.midlayer(
-            input_emb=input_embeds,
-            hidden_states=hidden_states,
-            cache_hidden=cache_hidden,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            output_attentions=False,
-            use_cache=False,
-        )
+        # cache_hidden is per-layer: [[K_list, V_list], ...] of len num_layers
+        # (created by the TTT wrapper in specforge/core/eagle3.py).
+        for i, layer in enumerate(self.layers):
+            hidden_states = layer(
+                input_emb=input_embeds,
+                hidden_states=hidden_states,
+                cache_hidden=cache_hidden[i] if cache_hidden is not None else None,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                output_attentions=False,
+                use_cache=False,
+            )
+        return hidden_states
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        # Back-compat: single-layer checkpoints saved before the multi-layer
+        # refactor use `midlayer.*`; map to `layers.0.*` (same remap sglang's
+        # llama_eagle3 applies at load time).
+        if any(k.startswith("midlayer.") for k in state_dict.keys()):
+            state_dict = {
+                (
+                    "layers.0." + k[len("midlayer.") :]
+                    if k.startswith("midlayer.")
+                    else k
+                ): v
+                for k, v in state_dict.items()
+            }
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)

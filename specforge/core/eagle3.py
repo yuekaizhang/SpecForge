@@ -359,7 +359,9 @@ class OnlineEagle3Model(Eagle3Model):
         # for sequence paralle, position mask and input ids will split by sequence dim, need to keep origin for ttt shift
         global_input_ids = input_ids
         if self.attention_backend in ["sdpa", "fa", "usp"]:
-            cache_hidden = [[], []]
+            # one K/V cache per draft layer (multi-layer drafts)
+            num_draft_layers = getattr(self.draft_model, "num_layers", 1)
+            cache_hidden = [[[], []] for _ in range(num_draft_layers)]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
@@ -709,7 +711,9 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
         metric_losses = []
         metric_loss_denoms = []
         if self.attention_backend in ["sdpa", "fa"]:
-            cache_hidden = [[], []]
+            # one K/V cache per draft layer (multi-layer drafts)
+            num_draft_layers = getattr(self.draft_model, "num_layers", 1)
+            cache_hidden = [[[], []] for _ in range(num_draft_layers)]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             cache_hidden = None
@@ -929,7 +933,9 @@ class QwenAudioOnlineEagle3Model(Eagle3Model):
             [],
         )
         if self.attention_backend in ["sdpa", "fa"]:
-            cache_hidden = [[], []]
+            # one K/V cache per draft layer (multi-layer drafts)
+            num_draft_layers = getattr(self.draft_model, "num_layers", 1)
+            cache_hidden = [[[], []] for _ in range(num_draft_layers)]
             past_key_values = None
         elif self.attention_backend == "flex_attention":
             cache_hidden = None

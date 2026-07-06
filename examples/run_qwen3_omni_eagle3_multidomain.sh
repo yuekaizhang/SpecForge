@@ -40,6 +40,9 @@ TARGET_MODEL=${TARGET_MODEL:-Qwen/Qwen3-Omni-30B-A3B-Instruct}
 INSTRUCTION="Transcribe the English audio into text."
 TRAIN_DATA=${TRAIN_DATA:-outputs/multidomain/combined_train}
 TTT_LENGTH=${TTT_LENGTH:-7}
+# Draft architecture config; override for variants, e.g. the 2-layer draft:
+#   DRAFT_CONFIG=configs/qwen3-omni-30b-eagle3-2layer.json
+DRAFT_CONFIG=${DRAFT_CONFIG:-configs/qwen3-omni-30b-eagle3.json}
 # Drop very long utterances (AMI/Earnings22) whose variable-length Qwen3-Omni
 # mels (~100 frames/s) blow up per-sample memory and OOM at batch-size 1.
 # 3000 frames ≈ 30 s, matching the LibriSpeech length that trained fine.
@@ -58,7 +61,7 @@ fi
 
 torchrun --nproc_per_node 8 scripts/train_eagle3.py \
   --target-model-path "$TARGET_MODEL" \
-  --draft-model-config configs/qwen3-omni-30b-eagle3.json \
+  --draft-model-config "$DRAFT_CONFIG" \
   --train-data-path "$TRAIN_DATA" \
   --keep-transcription-spaces \
   --is-audio \
