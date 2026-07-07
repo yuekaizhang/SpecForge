@@ -1,9 +1,10 @@
 #!/bin/bash
 # Full AISHELL train-split, 1 epoch, 8-GPU data-parallel.
 # Effective batch = 8 (batch-size 1 per GPU x 8 ranks). lr 1e-4 = repo EAGLE3 standard.
-# Checkpoints every ~3000 steps (~hourly). Same env workarounds as the proof run
-# (sdpa attention, reference loss, OMP=1, expandable allocator) — see comments in
-# run_qwen2_audio_eagle3_online.sh for why.
+# Checkpoints every ~3000 steps (~hourly). Env workarounds: OMP/MKL=1 prevents
+# the fork+OpenMP-threadpool deadlock in torch.stft when datasets.map forks
+# after the target model touched CUDA; expandable_segments reduces allocator
+# fragmentation from the TTT unroll's vocab-sized logit tensors.
 set -euo pipefail
 ROOT=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/speculative
 # Self-contained: use the isolated SpecForge env (Python 3.12) so `specforge` imports.

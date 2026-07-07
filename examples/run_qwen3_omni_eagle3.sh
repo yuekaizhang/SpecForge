@@ -18,7 +18,8 @@ cd "$ROOT/SpecForge"
 export HF_HOME=/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/.cache/huggingface
 export HF_HUB_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
-# Proven env workarounds (see run_qwen2_audio_eagle3_online.sh):
+# Proven env workarounds (OMP/MKL=1: fork+OpenMP torch.stft deadlock in
+# datasets.map workers; expandable_segments: TTT-unroll allocator churn):
 export TORCHDYNAMO_DISABLE=1
 export SPECFORGE_REFERENCE_LOSS=1
 export OMP_NUM_THREADS=1
