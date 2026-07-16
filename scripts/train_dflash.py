@@ -238,17 +238,48 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
             ).eval().to(device)
         target_model = HFDFlashTargetModel(raw_model)
     else:
-        target_model_kwargs = {}
-        if args.target_model_backend == "sglang":
-            target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
-        target_model = get_dflash_target_model(
-            pretrained_model_name_or_path=args.target_model_path,
-            backend=args.target_model_backend,
-            torch_dtype=torch.bfloat16,
-            device=device_type if args.target_model_backend == "hf" else None,
-            trust_remote_code=args.trust_remote_code,
-            **target_model_kwargs,
-    )
+        from transformers import AutoConfig
+
+        _tgt_cfg = AutoConfig.from_pretrained(args.target_model_path)
+        if getattr(_tgt_cfg, "model_type", "") == "qwen3_omni_moe":
+            # Text-only DFlash on the Qwen3-Omni thinker. The thinker is a
+            # *ConditionalGeneration model that AutoModelForCausalLM cannot map
+            # (qwen3_omni_moe is not in the CausalLM auto-map) and the sglang
+            # thinker lacks set_eagle3_layers_to_capture, so neither the hf nor
+            # the sglang backend in get_dflash_target_model works here. Load the
+            # THINKER ONLY (~59 GiB bf16; talker/code2wav skipped) via HF and
+            # wrap it in HFDFlashTargetModel, exactly like the is_audio path —
+            # its forward captures hidden_states from output_hidden_states, which
+            # works for text input just as it does for audio.
+            from transformers import Qwen3OmniMoeThinkerForConditionalGeneration
+
+            raw_model = (
+                Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
+                    args.target_model_path, dtype=torch.bfloat16
+                )
+                .eval()
+                .to(device)
+            )
+            # Tied-head guard (the Qwen2-Audio DFlash bug class): the tie flag
+            # lives ONLY in the nested thinker_config.text_config (False here);
+            # the checkpoint ships a real separate thinker.lm_head.weight.
+            assert not raw_model.config.get_text_config().tie_word_embeddings
+            assert not torch.equal(
+                raw_model.lm_head.weight, raw_model.model.embed_tokens.weight
+            ), "Qwen3-Omni thinker lm_head must NOT be tied to embed_tokens"
+            target_model = HFDFlashTargetModel(raw_model)
+        else:
+            target_model_kwargs = {}
+            if args.target_model_backend == "sglang":
+                target_model_kwargs = SGLangBackendArgs.from_args(args).to_kwargs()
+            target_model = get_dflash_target_model(
+                pretrained_model_name_or_path=args.target_model_path,
+                backend=args.target_model_backend,
+                torch_dtype=torch.bfloat16,
+                device=device_type if args.target_model_backend == "hf" else None,
+                trust_remote_code=args.trust_remote_code,
+                **target_model_kwargs,
+            )
 
     if args.draft_config_path:
         draft_config = AutoConfig.from_pretrained(args.draft_config_path)
